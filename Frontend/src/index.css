@@ -1,4 +1,184 @@
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ==========================================================================
+   GLOBAL RESPONSIVE ENGINE (AFFECTS ALL PAGES AUTOMATICALLY)
+   ========================================================================== */
+
+/* 1. Prevent awkward horizontal page shaking on mobile */
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100vh;
+  overflow-x: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 2. Prevent iOS Safari from auto-zooming on input fields */
+input, select, textarea {
+  font-size: 16px !important;
+}
+@media (min-width: 768px) {
+  input, select, textarea {
+    font-size: 14px !important;
+  }
+}
+
+/* ==========================================================================
+   MOBILE PHONES & SMALL TABLETS (SCREEN WIDTH UNDER 768px)
+   ========================================================================== */
+@media (max-width: 768px) {
+
+  /* ── A. DASHBOARD WRAPPERS: Stack Vertically ── */
+  div.min-h-screen.flex,
+  .flex.min-h-screen {
+    flex-direction: column !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    overflow-x: hidden !important;
+  }
+
+  /* ── B. SIDEBARS: Transform into a Smooth Swipeable Mobile App Nav-Bar ── */
+  div.w-60, 
+  div.w-64, 
+  aside.w-60, 
+  aside.w-64,
+  div[class*="w-60"],
+  div[class*="w-64"] {
+    width: 100% !important;
+    min-width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 40 !important;
+    padding: 10px 12px !important;
+    border-right: none !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+  }
+
+  /* Make navigation tabs scroll horizontally like mobile app pills */
+  div.w-60 nav, 
+  div.w-64 nav, 
+  aside nav {
+    display: flex !important;
+    flex-direction: row !important;
+    overflow-x: auto !important;
+    white-space: nowrap !important;
+    gap: 6px !important;
+    padding: 6px 0 !important;
+    -webkit-overflow-scrolling: touch !important;
+    scrollbar-width: none; /* Hide scrollbar for Chrome/Safari/Firefox */
+  }
+
+  div.w-60 nav::-webkit-scrollbar, 
+  div.w-64 nav::-webkit-scrollbar, 
+  aside nav::-webkit-scrollbar {
+    display: none !important;
+  }
+
+  /* Tab button styling on mobile */
+  div.w-60 nav button, 
+  div.w-64 nav button, 
+  aside nav button {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    padding: 6px 12px !important;
+    font-size: 12px !important;
+    border-radius: 9999px !important;
+  }
+
+  /* Hide excessive sidebar metadata text on phones to save screen space */
+  div.w-60 > div.mt-4, 
+  div.w-64 > div.mt-4,
+  div.w-60 > div:last-child p,
+  div.w-64 > div:last-child p {
+    display: none !important;
+  }
+
+  /* Compact logout button on mobile */
+  div.w-60 button:last-child,
+  div.w-64 button:last-child {
+    margin-top: 6px !important;
+    padding: 4px 10px !important;
+    font-size: 11px !important;
+  }
+
+  /* ── C. MAIN CONTENT AREA: Full Width & Compact Padding ── */
+  .flex-1.bg-slate-50,
+  .flex-1.p-6,
+  .flex-1.p-8,
+  main.flex-1 {
+    padding: 12px !important;
+    width: 100vw !important;
+    max-width: 100vw !important;
+    overflow-x: hidden !important;
+  }
+
+  /* Adjust huge page titles on mobile */
+  h1.text-3xl { font-size: 1.5rem !important; }
+  h2.text-2xl { font-size: 1.25rem !important; }
+
+  /* ── D. TABLES: Auto Horizontal Scroll Across All Pages ── */
+  /* This prevents tables from ever breaking the phone screen width */
+  table {
+    display: block !important;
+    width: 100% !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch !important;
+    white-space: nowrap !important;
+  }
+
+  /* ── E. GRIDS: Prevent Squeezed Multi-Column Layouts ── */
+  .grid.grid-cols-4,
+  .grid.grid-cols-3,
+  .grid.grid-cols-5,
+  .lg\:grid-cols-3,
+  .lg\:grid-cols-4,
+  .md\:grid-cols-4,
+  .md\:grid-cols-5 {
+    grid-template-columns: repeat(1, minmax(0, 1fr)) !important;
+    gap: 12px !important;
+  }
+
+  /* Overview KPI / Stat Cards: Show as 2 clean columns on phones */
+  .grid.grid-cols-2,
+  .grid.grid-cols-4.mb-6,
+  .grid.grid-cols-4.mb-8 {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: 8px !important;
+  }
+
+  /* ── F. FORMS & SEARCH FILTERS: Stack into Clean Rows ── */
+  .flex.gap-3.mb-4,
+  .flex.gap-3.mb-6,
+  .flex.gap-3.mb-5 {
+    flex-direction: column !important;
+    gap: 8px !important;
+  }
+
+  .flex.gap-3.mb-4 > input,
+  .flex.gap-3.mb-4 > select,
+  .flex.gap-3.mb-6 > input,
+  .flex.gap-3.mb-6 > select,
+  .flex.gap-3.mb-5 > input,
+  .flex.gap-3.mb-5 > select {
+    width: 100% !important;
+    min-width: 100% !important;
+  }
+
+  /* ── G. POPUP MODALS: Fit Perfectly on Any Phone Screen ── */
+  .fixed.inset-0 > div,
+  .fixed.inset-0 .bg-white {
+    width: 95vw !important;
+    max-width: 95vw !important;
+    max-height: 90vh !important;
+    margin: auto !important;
+    padding: 16px !important;
+    overflow-y: auto !important;
+  }
+}

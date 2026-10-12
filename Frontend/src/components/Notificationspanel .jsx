@@ -1,15 +1,4 @@
-/**
- * NotificationsPanel.jsx
- * Drop-in notification bell for any dashboard.
- * Place in header row: <NotificationsPanel />
- *
- * Backend endpoints expected:
- *   GET  /notifications/my         → [{id, title, message, type, is_read, created_at, sender_name}]
- *   PUT  /notifications/:id/read   → mark one read
- *   PUT  /notifications/read-all   → mark all read
- *
- * HR/Admin send via MonitorWorkers "Send Message" panel → POST /notifications/send
- */
+
 
 import { useState, useEffect, useCallback } from "react";
 import API from "../api";

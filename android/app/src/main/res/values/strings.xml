@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">saccoflow</string>
+    <string name="title_activity_main">saccoflow</string>
+    <string name="package_name">com.saccoflow360.app</string>
+    <string name="custom_url_scheme">com.saccoflow360.app</string>
+</resources>

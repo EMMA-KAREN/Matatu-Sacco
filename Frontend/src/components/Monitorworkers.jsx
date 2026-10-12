@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import API from "../api";
+import { useAuth } from "../context/AuthContext";
 
 // ─── helpers ────────────────────────────────────────────────
 const tok = () => localStorage.getItem("token");
@@ -40,6 +41,7 @@ function Toast({ msg, type, onClose }) {
 
 // ─── main component ─────────────────────────────────────────
 export default function MonitorWorkers({ userRole = "hr" }) {
+  const { user } = useAuth();
   const [tab, setTab] = useState("overview");
   const [toast, setToast] = useState(null);
 
@@ -55,11 +57,13 @@ export default function MonitorWorkers({ userRole = "hr" }) {
   const [workerWarnings, setWorkerWarnings] = useState([]);
   const [workerSalaryHistory, setWorkerSalaryHistory] = useState([]);
 
+  // report parameters
+  const [reportMonth, setReportMonth] = useState(new Date().toISOString().slice(0, 7));
+
   // forms
   const [warningForm, setWarningForm] = useState({ member_id: "", severity: "minor", reason: "" });
   const [salaryForm, setSalaryForm] = useState({ member_id: "", amount: "", payment_type: "monthly", period: "", payment_method: "cash", mpesa_code: "", notes: "" });
   const [salaryConfigForm, setSalaryConfigForm] = useState({ member_id: "", base_salary: "", payment_frequency: "monthly", role_label: "" });
-  const [reminderForm, setReminderForm] = useState({ message: "" });
 
   // search / filter
   const [search, setSearch] = useState("");
@@ -130,7 +134,12 @@ export default function MonitorWorkers({ userRole = "hr" }) {
     if (payment_method === "mpesa" && !mpesa_code) return showToast("Enter M-Pesa code", "error");
     const res = await post("/salary/pay", { member_id: parseInt(member_id), amount: parseFloat(amount), payment_type, period, payment_method, mpesa_code, notes });
     if (!res.ok) return showToast("Payment failed", "error");
-    showToast(`KES ${Number(amount).toLocaleString()} salary paid ✓`);
+    const d = await res.json();
+    if (d.status === "pending_approval") {
+      showToast("Salary initiated ✓. Awaiting administrator final approval.");
+    } else {
+      showToast(`KES ${Number(amount).toLocaleString()} salary paid successfully ✓`);
+    }
     setSalaryForm(f => ({ ...f, amount: "", period: "", mpesa_code: "", notes: "" }));
     fetchAll();
     if (selectedWorker) {
@@ -148,6 +157,218 @@ export default function MonitorWorkers({ userRole = "hr" }) {
     fetchAll();
   };
 
+  const handleApproveSalary = async (id) => {
+    const res = await put(`/salary/payments/${id}/approve`);
+    if (!res.ok) return showToast("Authorization failed", "error");
+    showToast("Salary payment approved and marked as paid ✓");
+    fetchAll();
+    if (selectedWorker) {
+      const salHist = await get(`/salary/payments?member_id=${selectedWorker.id}`);
+      setWorkerSalaryHistory(salHist);
+    }
+  };
+
+  const handleRejectSalary = async (id) => {
+    const res = await put(`/salary/payments/${id}/reject`);
+    if (!res.ok) return showToast("Rejection failed", "error");
+    showToast("Salary payment request rejected");
+    fetchAll();
+    if (selectedWorker) {
+      const salHist = await get(`/salary/payments?member_id=${selectedWorker.id}`);
+      setWorkerSalaryHistory(salHist);
+    }
+  };
+
+  const exportSalaryReport = (month, format) => {
+    const monthPayments = salaryPayments.filter(p => p.created_at?.startsWith(month) && p.status === "approved");
+    if (monthPayments.length === 0) {
+      return showToast(`No authorized salary records found for period: ${month}`, "error");
+    }
+
+    const totalDisbursed = monthPayments.reduce((s, p) => s + p.amount, 0);
+
+    if (format === "csv") {
+      // 📊 Spreadsheet Export (UTF-8 BOM Included)
+      let csv = "\uFEFF";
+      csv += "Payment ID,Worker Name,Membership No,Amount (KES),Period,Type,Payment Method,M-Pesa Reference,Notes,Disbursement Date\n";
+      monthPayments.forEach(p => {
+        csv += `${p.id},"${p.member_name?.replace(/"/g, '""')}",${p.membership_no},${p.amount},${p.period},${p.payment_type},${p.payment_method},${p.mpesa_code || "N/A"},"${(p.notes || "").replace(/"/g, '""')}",${p.created_at?.split("T")[0]}\n`;
+      });
+
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.setAttribute("download", `SACCO_Salary_Disbursement_Report_${month}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      showToast(`Spreadsheet exported successfully ✓`);
+    } 
+    else if (format === "word") {
+      // 📝 Word Document Export (.doc inline HTML)
+      let html = `
+        <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+        <head><title>Salary Report</title>
+        <style>
+          body { font-family: Arial, sans-serif; color: #333333; margin: 20px; }
+          table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+          th, td { border: 1px solid #cccccc; padding: 8px; text-align: left; font-size: 11pt; }
+          th { background-color: #f2f2f2; font-weight: bold; }
+          h2 { text-align: center; color: #0f172a; margin-bottom: 5px; }
+          p { margin: 3px 0; font-size: 10pt; }
+        </style>
+        </head>
+        <body>
+          <h2>2KM SACCO</h2>
+          <h3 style="text-align:center;margin-top:0;">Monthly Salary Disbursement Statement</h3>
+          <p><b>Report Period:</b> ${month}</p>
+          <p><b>Exported On:</b> ${new Date().toLocaleDateString()}</p>
+          <p><b>Total Disbursed:</b> KES ${totalDisbursed.toLocaleString()}.00</p>
+          <br/>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Worker Name</th>
+                <th>Membership No</th>
+                <th>Amount (KES)</th>
+                <th>Period</th>
+                <th>Type</th>
+                <th>Method</th>
+                <th>Ref/M-Pesa</th>
+                <th>Date Paid</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${monthPayments.map(p => `
+                <tr>
+                  <td>#${p.id}</td>
+                  <td><b>${p.member_name}</b></td>
+                  <td>${p.membership_no}</td>
+                  <td>${p.amount.toLocaleString()}.00</td>
+                  <td>${p.period}</td>
+                  <td style="text-transform:capitalize;">${p.payment_type}</td>
+                  <td style="text-transform:capitalize;">${p.payment_method}</td>
+                  <td>${p.mpesa_code || "N/A"}</td>
+                  <td>${p.created_at?.split("T")[0]}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </body>
+        </html>
+      `;
+
+      const blob = new Blob([html], { type: "application/msword" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.setAttribute("download", `SACCO_Salary_Report_${month}.doc`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      showToast(`Word Statement exported ✓`);
+    } 
+    else if (format === "pdf") {
+      // 📄 PDF Export via Spawning a styled high-fidelity Printable Window
+      const printWindow = window.open("", "_blank");
+      printWindow.document.write(`
+        <html>
+        <head>
+          <title>SACCO Salary Disbursement Report - ${month}</title>
+          <style>
+            body { font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #333; margin: 40px; }
+            .header { text-align: center; border-bottom: 2px solid #0f172a; padding-bottom: 20px; margin-bottom: 30px; }
+            .header h1 { margin: 0; font-size: 24px; color: #0f172a; }
+            .header p { margin: 5px 0 0 0; font-size: 14px; color: #64748b; }
+            .meta-box { display: flex; justify-content: space-between; margin-bottom: 30px; font-size: 13px; }
+            .meta-box div { line-height: 1.6; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+            th, td { padding: 10px; text-align: left; font-size: 12px; border-bottom: 1px solid #e2e8f0; }
+            th { background-color: #f8fafc; font-weight: bold; color: #0f172a; text-transform: uppercase; letter-spacing: 0.5px; }
+            .totals { text-align: right; font-size: 14px; font-weight: bold; margin-bottom: 40px; }
+            .totals span { color: #16a34a; font-size: 16px; }
+            .signatures { display: flex; justify-content: space-between; margin-top: 60px; font-size: 12px; }
+            .sig-line { width: 200px; border-top: 1px solid #64748b; text-align: center; padding-top: 8px; margin-top: 45px; color: #64748b; }
+            @media print {
+              body { margin: 20px; }
+              button { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <h1>2KM SACCO</h1>
+            <p>Monthly Salary Disbursement & Payroll Ledger Statement</p>
+          </div>
+          
+          <div class="meta-box">
+            <div>
+              <strong>Report Period:</strong> ${month}<br/>
+              <strong>Status:</strong> Approved & Settled Ledger<br/>
+              <strong>Exported On:</strong> ${new Date().toLocaleDateString()}
+            </div>
+            <div style="text-align: right;">
+              <strong>SACCO Office:</strong> Mombasa, Kenya<br/>
+              <strong>Email:</strong> info@2kmsacco.com<br/>
+              <strong>Authorized By:</strong> SACCO Administration
+            </div>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Worker Name</th>
+                <th>Membership No</th>
+                <th>Type</th>
+                <th>Method</th>
+                <th>Ref/M-Pesa</th>
+                <th>Date Disbursed</th>
+                <th>Amount (KES)</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${monthPayments.map(p => `
+                <tr>
+                  <td>#${p.id}</td>
+                  <td><strong>${p.member_name}</strong></td>
+                  <td>${p.membership_no}</td>
+                  <td style="text-transform: capitalize;">${p.payment_type}</td>
+                  <td style="text-transform: capitalize;">${p.payment_method}</td>
+                  <td><code>${p.mpesa_code || "N/A"}</code></td>
+                  <td>${p.created_at?.split("T")[0]}</td>
+                  <td><strong>${p.amount.toLocaleString()}.00</strong></td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+
+          <div class="totals">
+            Total Payroll Disbursed: <span>KES ${totalDisbursed.toLocaleString()}.00</span>
+          </div>
+
+          <div class="signatures">
+            <div>
+              <div class="sig-line">Prepared By: SACCO HR Manager</div>
+            </div>
+            <div>
+              <div class="sig-line">Authorized By: SACCO Administrator</div>
+            </div>
+          </div>
+
+          <script>
+            window.onload = function() {
+              window.print();
+              setTimeout(function() { window.close(); }, 500);
+            };
+          </script>
+        </body>
+        </html>
+      `);
+      printWindow.document.close();
+    }
+  };
+
   // ── derived ──
   const filteredMembers = members.filter(m => {
     const matchSearch = m.name?.toLowerCase().includes(search.toLowerCase()) || m.membership_no?.toLowerCase().includes(search.toLowerCase());
@@ -161,13 +382,17 @@ export default function MonitorWorkers({ userRole = "hr" }) {
     return matchSev && (tab === "warnings" ? matchSearch : true);
   });
 
-  const totalSalaryThisMonth = salaryPayments
+  const approvedPayments = salaryPayments.filter(p => p.status === "approved");
+  const pendingPayments = salaryPayments.filter(p => p.status === "pending_approval");
+
+  const totalSalaryThisMonth = approvedPayments
     .filter(p => p.created_at?.startsWith(new Date().toISOString().slice(0, 7)))
     .reduce((s, p) => s + p.amount, 0);
 
+  const totalSalaryAllTime = approvedPayments.reduce((s, p) => s + p.amount, 0);
+
   const unacknowledgedWarnings = allWarnings.filter(w => !w.is_acknowledged).length;
 
-  // ── period helper ──
   const defaultPeriod = (type) => {
     const d = new Date();
     if (type === "weekly") {
@@ -177,11 +402,10 @@ export default function MonitorWorkers({ userRole = "hr" }) {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
   };
 
-  // ─── TABS ───────────────────────────────────────────────────
   const TABS = [
     { key: "overview", label: "📊 Overview" },
     { key: "workers", label: "👷 Workers" },
-    { key: "salary", label: "💰 Salary" },
+    { key: "salary", label: `💰 Salary${pendingPayments.length > 0 ? ` (${pendingPayments.length})` : ""}` },
     { key: "warnings", label: `⚠️ Warnings${unacknowledgedWarnings > 0 ? ` (${unacknowledgedWarnings})` : ""}` },
   ];
 
@@ -189,7 +413,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
     <div className="min-h-screen bg-slate-50" style={{ fontFamily: "'Trebuchet MS', sans-serif" }}>
       {toast && <Toast {...toast} onClose={() => setToast(null)} />}
 
-      {/* ── top nav ── */}
       <div className="bg-slate-900 text-white px-6 py-3 flex items-center gap-4 sticky top-0 z-10 shadow-xl">
         <span className="text-sm font-black uppercase tracking-widest text-slate-400 mr-2">Worker Monitor</span>
         <div className="flex gap-1">
@@ -211,8 +434,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
         {tab === "overview" && (
           <div>
             <h2 className="text-2xl font-black text-slate-800 mb-6">Workforce Overview</h2>
-
-            {/* stat cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
               <StatPill label="Total Workers" value={members.length} accent="bg-blue-50 border-blue-200 text-blue-700" />
               <StatPill label="Salary This Month" value={`KES ${totalSalaryThisMonth.toLocaleString()}`} accent="bg-emerald-50 border-emerald-200 text-emerald-700" />
@@ -220,7 +441,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
               <StatPill label="Salary Configs" value={salaryConfigs.length} accent="bg-purple-50 border-purple-200 text-purple-700" />
             </div>
 
-            {/* role breakdown */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
               <div className="bg-white border border-slate-200 rounded-xl p-5">
                 <h3 className="font-black text-slate-700 mb-4 text-sm">Workers by Role</h3>
@@ -241,7 +461,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                 })}
               </div>
 
-              {/* recent warnings */}
               <div className="bg-white border border-slate-200 rounded-xl p-5">
                 <h3 className="font-black text-slate-700 mb-4 text-sm">Recent Warnings</h3>
                 {filteredWarnings.slice(0, 6).length === 0 ? (
@@ -264,7 +483,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
               </div>
             </div>
 
-            {/* workers needing salary config */}
             <div className="bg-white border border-amber-200 rounded-xl p-5">
               <h3 className="font-black text-amber-700 mb-3 text-sm">
                 ⚡ Workers Without Salary Config ({members.filter(m => !salaryConfigs.find(c => c.member_id === m.id)).length})
@@ -284,13 +502,12 @@ export default function MonitorWorkers({ userRole = "hr" }) {
           </div>
         )}
 
-        {/* ═══════════════════ WORKERS LIST ═══════════════════ */}
+        {/* ══ WORKERS LIST ══ */}
         {tab === "workers" && (
           <div>
             <div className="flex items-center justify-between mb-5">
-              <h2 className="text-2xl font-black text-slate-800">👷 All Workers</h2>
+              <h2 className="text-2xl font-black text-slate-800">All Workers</h2>
             </div>
-
             <div className="flex gap-3 mb-4 flex-wrap">
               <input placeholder="Search name or membership no..." value={search} onChange={e => setSearch(e.target.value)}
                 className="flex-1 border border-slate-300 rounded-lg p-2.5 text-sm focus:border-blue-500 outline-none" />
@@ -340,7 +557,7 @@ export default function MonitorWorkers({ userRole = "hr" }) {
           </div>
         )}
 
-        {/* ═══════════════════ WORKER DETAIL ═══════════════════ */}
+        {/* ══ WORKER DETAIL ══ */}
         {tab === "worker-detail" && selectedWorker && (
           <div>
             <div className="flex items-center gap-4 mb-6">
@@ -367,9 +584,7 @@ export default function MonitorWorkers({ userRole = "hr" }) {
             )}
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* LEFT — salary config + pay */}
               <div className="space-y-4">
-                {/* salary config */}
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
                   <h3 className="font-black text-slate-700 mb-3 text-sm">💼 Salary Configuration</h3>
                   <div className="space-y-2">
@@ -402,9 +617,8 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                   </div>
                 </div>
 
-                {/* pay now */}
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
-                  <h3 className="font-black text-slate-700 mb-3 text-sm">💸 Pay Salary</h3>
+                  <h3 className="font-black text-slate-700 mb-3 text-sm">💸 Pay / Initiate Salary</h3>
                   <div className="space-y-2">
                     <div>
                       <label className="text-xs text-slate-400 uppercase tracking-widest mb-0.5 block">Amount (KES)</label>
@@ -456,12 +670,11 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                         className="w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500" />
                     </div>
                     <button onClick={paySalary} className="w-full bg-emerald-600 text-white font-black py-2 rounded-lg text-sm hover:bg-emerald-700">
-                      ✓ Pay Now
+                      ✓ Pay/Initiate
                     </button>
                   </div>
                 </div>
 
-                {/* issue warning */}
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
                   <h3 className="font-black text-slate-700 mb-3 text-sm">⚠️ Issue Warning</h3>
                   <div className="space-y-2">
@@ -490,7 +703,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                 </div>
               </div>
 
-              {/* MIDDLE — warnings history */}
               <div className="space-y-4">
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
                   <h3 className="font-black text-slate-700 mb-3 text-sm">Warning History ({workerWarnings.length})</h3>
@@ -519,7 +731,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                 </div>
               </div>
 
-              {/* RIGHT — salary history */}
               <div className="space-y-4">
                 <div className="bg-white border border-slate-200 rounded-xl p-5">
                   <h3 className="font-black text-slate-700 mb-3 text-sm">Salary History</h3>
@@ -532,7 +743,14 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                           <div>
                             <p className="font-black text-sm text-emerald-700">KES {p.amount?.toLocaleString()}</p>
                             <p className="text-xs text-slate-400">{p.period} · {p.payment_method}</p>
-                            {p.notes && <p className="text-xs text-slate-400 italic">{p.notes}</p>}
+                            <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-full ${
+                              p.status === "approved" ? "bg-green-100 text-green-700" :
+                              p.status === "rejected" ? "bg-red-100 text-red-700" :
+                              "bg-amber-100 text-amber-800"
+                            }`}>
+                              {p.status === "approved" ? "Paid" : p.status === "rejected" ? "Rejected" : "Pending Approval"}
+                            </span>
+                            {p.notes && <p className="text-xs text-slate-400 italic mt-1">{p.notes}</p>}
                           </div>
                           <div className="text-right">
                             <span className="text-xs bg-emerald-50 border border-emerald-200 text-emerald-700 px-2 py-0.5 rounded font-bold capitalize">{p.payment_type}</span>
@@ -542,7 +760,7 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                       ))}
                       <div className="p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-center">
                         <span className="text-xs font-black text-emerald-700">
-                          Total Paid: KES {workerSalaryHistory.reduce((s, p) => s + p.amount, 0).toLocaleString()}
+                          Total Paid: KES {workerSalaryHistory.filter(p => p.status === "approved").reduce((s, p) => s + p.amount, 0).toLocaleString()}
                         </span>
                       </div>
                     </div>
@@ -553,19 +771,79 @@ export default function MonitorWorkers({ userRole = "hr" }) {
           </div>
         )}
 
-        {/* ═══════════════════ SALARY TAB ═══════════════════ */}
+        {/* ══ SALARY ══ */}
         {tab === "salary" && (
-          <div>
-            <h2 className="text-2xl font-black text-slate-800 mb-6">💰 Salary Management</h2>
+          <div className="space-y-6">
+            <div className="flex justify-between items-center bg-white border border-slate-200 rounded-xl p-4 flex-wrap gap-4 shadow-sm">
+              <div>
+                <h2 className="text-2xl font-black text-slate-800">💰 Salary & Pay Management</h2>
+                <p className="text-sm text-slate-400">Initiate payroll disbursements, download reports, and authorize pending transfers.</p>
+              </div>
+              <div className="flex gap-2 items-center">
+                <input type="month" value={reportMonth} onChange={e => setReportMonth(e.target.value)}
+                  className="border border-slate-350 rounded-lg px-3 py-1.5 text-xs font-bold outline-none bg-white text-slate-700" />
+                
+                <select 
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      exportSalaryReport(reportMonth, e.target.value);
+                      e.target.value = ""; // Reset
+                    }
+                  }}
+                  className="bg-emerald-600 text-white font-extrabold px-3 py-2 rounded-lg text-xs shadow-sm cursor-pointer outline-none border-none"
+                >
+                  <option value="" disabled selected>📥 Download Report As...</option>
+                  <option value="csv">📊 Spreadsheet (CSV/Excel)</option>
+                  <option value="word">📝 Word Document (.doc)</option>
+                  <option value="pdf">📄 PDF Document (.pdf)</option>
+                </select>
+              </div>
+            </div>
 
-            {/* summary cards */}
             <div className="grid grid-cols-3 gap-4 mb-6">
               {[
                 { label: "Total Paid This Month", value: `KES ${totalSalaryThisMonth.toLocaleString()}`, accent: "bg-emerald-50 border-emerald-200 text-emerald-700" },
-                { label: "Total Paid All Time", value: `KES ${salaryPayments.reduce((s, p) => s + p.amount, 0).toLocaleString()}`, accent: "bg-blue-50 border-blue-200 text-blue-700" },
+                { label: "Total Paid All Time", value: `KES ${totalSalaryAllTime.toLocaleString()}`, accent: "bg-blue-50 border-blue-200 text-blue-700" },
                 { label: "Configured Workers", value: salaryConfigs.length, accent: "bg-purple-50 border-purple-200 text-purple-700" },
               ].map((s, i) => <StatPill key={i} {...s} />)}
             </div>
+
+            {/* TWO-TIER TRANSFERS CURRENTLY PENDING ADMIN APPROVAL */}
+            {pendingPayments.length > 0 && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-5 mb-6">
+                <h3 className="font-black text-amber-800 text-sm mb-3">⏳ Pending Salary Approvals ({pendingPayments.length})</h3>
+                <div className="space-y-3">
+                  {pendingPayments.map(p => (
+                    <div key={p.id} className="flex justify-between items-center bg-white border border-amber-100 rounded-xl p-4 shadow-sm text-xs">
+                      <div>
+                        <p className="font-extrabold text-slate-800 text-sm">{p.member_name} ({p.membership_no})</p>
+                        <p className="text-slate-500 mt-1">
+                          Period: <span className="font-bold text-slate-700">{p.period}</span> · 
+                          Type: <span className="font-bold text-slate-700 capitalize">{p.payment_type}</span> · 
+                          Method: <span className="font-bold text-slate-700 capitalize">{p.payment_method}</span>
+                        </p>
+                        {p.notes && <p className="text-slate-400 italic mt-0.5">Notes: {p.notes}</p>}
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <span className="font-black text-sm text-emerald-700">KES {p.amount?.toLocaleString()}</span>
+                        {["admin", "director"].includes(user?.role) && (
+                          <div className="flex gap-1.5">
+                            <button onClick={() => handleApproveSalary(p.id)}
+                              className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold px-3 py-1.5 rounded-lg text-xs transition-colors">
+                              Approve
+                            </button>
+                            <button onClick={() => handleRejectSalary(p.id)}
+                              className="bg-red-500 hover:bg-red-650 text-white font-extrabold px-3 py-1.5 rounded-lg text-xs transition-colors">
+                              Reject
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* salary configs table */}
             <div className="bg-white border border-slate-200 rounded-xl overflow-hidden mb-6">
@@ -627,6 +905,7 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                     <th className="p-3 text-left">Worker</th>
                     <th className="p-3 text-left">Amount</th>
                     <th className="p-3 text-left">Period</th>
+                    <th className="p-3 text-left">Status</th>
                     <th className="p-3 text-left">Method</th>
                     <th className="p-3 text-left">Date</th>
                   </tr>
@@ -641,6 +920,15 @@ export default function MonitorWorkers({ userRole = "hr" }) {
                       <td className="p-3 font-black text-emerald-700">KES {p.amount?.toLocaleString()}</td>
                       <td className="p-3 text-slate-500 text-xs">{p.period}</td>
                       <td className="p-3">
+                        <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full ${
+                          p.status === "approved" ? "bg-green-100 text-green-700" :
+                          p.status === "rejected" ? "bg-red-100 text-red-700" :
+                          "bg-amber-100 text-amber-800"
+                        }`}>
+                          {p.status === "approved" ? "Disbursed" : p.status === "rejected" ? "Rejected" : "Pending Approval"}
+                        </span>
+                      </td>
+                      <td className="p-3">
                         <span className="capitalize text-xs bg-slate-100 px-2 py-0.5 rounded font-bold">{p.payment_method}</span>
                         {p.mpesa_code && <p className="text-xs text-slate-400">{p.mpesa_code}</p>}
                       </td>
@@ -653,7 +941,7 @@ export default function MonitorWorkers({ userRole = "hr" }) {
           </div>
         )}
 
-        {/* ═══════════════════ WARNINGS TAB ═══════════════════ */}
+        {/* ══ WARNINGS ══ */}
         {tab === "warnings" && (
           <div>
             <h2 className="text-2xl font-black text-slate-800 mb-6">⚠️ Disciplinary Warnings</h2>
@@ -670,7 +958,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
               </select>
             </div>
 
-            {/* quick issue form */}
             <div className="bg-white border border-slate-200 rounded-xl p-5 mb-6">
               <h3 className="font-black text-slate-700 mb-3 text-sm">Issue New Warning</h3>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
@@ -709,7 +996,6 @@ export default function MonitorWorkers({ userRole = "hr" }) {
               </div>
             </div>
 
-            {/* warnings list */}
             <div className="space-y-3">
               {filteredWarnings.length === 0 ? (
                 <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-slate-400">No warnings found</div>

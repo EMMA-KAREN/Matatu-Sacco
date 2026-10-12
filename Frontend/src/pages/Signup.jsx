@@ -12,6 +12,7 @@ export default function Signup() {
     role: ""
   });
 
+  const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
 
   const handleChange = (e) => {
@@ -34,9 +35,7 @@ export default function Signup() {
 
       const res = await fetch(`${API}/signup`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form)
       });
 
@@ -44,7 +43,6 @@ export default function Signup() {
 
       if (res.ok) {
         alert("Signup successful. Wait for HR approval.");
-
         setForm({
           membership_no: "",
           name: "",
@@ -56,7 +54,6 @@ export default function Signup() {
       } else {
         alert(data.error || "Signup failed");
       }
-
     } catch (err) {
       console.error(err);
       alert("Server error during signup");
@@ -66,10 +63,10 @@ export default function Signup() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-100">
+    <div className="min-h-screen flex items-center justify-center bg-gray-100 p-4">
       <form
         onSubmit={handleSignup}
-        className="bg-white shadow-lg rounded-xl p-8 w-full max-w-md space-y-4"
+        className="bg-white shadow-xl rounded-2xl p-8 w-full max-w-md space-y-3.5"
       >
         <h2 className="text-2xl font-bold text-center text-green-700">
           Create SACCO Account
@@ -80,7 +77,7 @@ export default function Signup() {
           placeholder="Membership Number"
           value={form.membership_no}
           onChange={handleChange}
-          className="w-full border p-3 rounded"
+          className="w-full border p-2.5 rounded-lg uppercase"
           required
         />
 
@@ -89,7 +86,7 @@ export default function Signup() {
           placeholder="Full Name"
           value={form.name}
           onChange={handleChange}
-          className="w-full border p-3 rounded"
+          className="w-full border p-2.5 rounded-lg"
           required
         />
 
@@ -98,7 +95,7 @@ export default function Signup() {
           placeholder="National ID"
           value={form.national_id}
           onChange={handleChange}
-          className="w-full border p-3 rounded"
+          className="w-full border p-2.5 rounded-lg"
           required
         />
 
@@ -107,32 +104,43 @@ export default function Signup() {
           placeholder="Phone Number"
           value={form.phone}
           onChange={handleChange}
-          className="w-full border p-3 rounded"
+          className="w-full border p-2.5 rounded-lg"
           required
         />
 
-        <input
-          type="password"
-          name="password"
-          placeholder="Password"
-          value={form.password}
-          onChange={handleChange}
-          className="w-full border p-3 rounded"
-          required
-        />
+        {/* Password input with Show/Hide Eye Toggle */}
+        <div className="relative">
+          <input
+            type={showPassword ? "text" : "password"}
+            name="password"
+            placeholder="Password"
+            value={form.password}
+            onChange={handleChange}
+            className="w-full border p-2.5 pr-14 rounded-lg"
+            required
+          />
+          <button
+            type="button"
+            onClick={() => setShowPassword(!showPassword)}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs font-bold text-gray-500 hover:text-black"
+          >
+            {showPassword ? "🙈 Hide" : "👁️ View"}
+          </button>
+        </div>
 
         <select
           name="role"
           value={form.role}
           onChange={handleChange}
-          className="w-full border p-3 rounded"
+          className="w-full border p-2.5 rounded-lg bg-white"
           required
         >
           <option value="">-- Select Role --</option>
           <option value="owner">Owner</option>
           <option value="driver">Driver</option>
           <option value="conductor">Conductor</option>
-          <option value="stage_operator">Stage Operator</option>
+          <option value="stage_operator">Main Stage Operator</option>
+          <option value="sub_stage_operator">Sub Stage Operator</option>
           <option value="hr">HR</option>
           <option value="director">Director</option>
           <option value="member">Member</option>
@@ -141,7 +149,7 @@ export default function Signup() {
         <button
           type="submit"
           disabled={loading || !form.role}
-          className={`w-full text-white p-3 rounded ${
+          className={`w-full text-white font-bold p-3 rounded-lg ${
             !form.role
               ? "bg-gray-400 cursor-not-allowed"
               : "bg-green-600 hover:bg-green-700"
@@ -152,7 +160,7 @@ export default function Signup() {
 
         <p className="text-center text-sm">
           Already have an account?{" "}
-          <Link to="/login" className="text-green-600 font-semibold">
+          <Link to="/login" className="text-green-600 font-semibold hover:underline">
             Login
           </Link>
         </p>

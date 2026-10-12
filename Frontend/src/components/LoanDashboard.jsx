@@ -1,8 +1,8 @@
-
 import { useState, useEffect } from "react";
 import API from "../api";
 import { useAuth } from "../context/AuthContext";
 import RepaymentAccount from "./RepaymentAccount";
+import MemberStatement from "./MemberStatement";
 
 const tok = () => localStorage.getItem("token");
 const hdr = (json = true) => ({
@@ -11,6 +11,8 @@ const hdr = (json = true) => ({
 });
 const authGet = (url) =>
   fetch(`${API}${url}`, { headers: hdr() }).then(r => r.ok ? r.json() : []);
+const authPost = (url, body) => fetch(`${API}${url}`, { method: "POST", headers: hdr(), body: JSON.stringify(body) });
+const authPut  = (url, body) => fetch(`${API}${url}`, { method: "PUT",  headers: hdr(), body: body ? JSON.stringify(body) : undefined });
 
 const STATUS_CONFIG = {
   pending:            { color: "bg-yellow-100 text-yellow-800 border-yellow-200",  icon: "⏳", label: "Pending Approval" },
@@ -27,14 +29,25 @@ const STATUS_CONFIG = {
 
 const STEPS = ["Loan Type", "Terms & Conditions", "Loan Details", "Guarantors", "Submit"];
 
-// Always-visible input — white bg, dark text, no way to miss what you're typing
-const inp = "w-full border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-emerald-500 bg-white text-gray-900 placeholder-gray-400";
+const inp = "w-full border border-gray-300 rounded-lg p-3 text-sm outline-none focus:border-emerald-500 bg-white text-gray-900 placeholder-gray-400 font-bold";
 const textArea = `${inp} resize-none`;
+
+const isPreexistingLoan = (loan) => {
+  if (!loan) return false;
+  return Boolean(
+    loan.is_existing ||
+    loan.is_existing_loan ||
+    loan.is_preexisting ||
+    loan.onboarded_by_hr ||
+    loan.purpose?.toLowerCase().includes("existing loan") ||
+    loan.purpose?.toLowerCase().includes("onboarded")
+  );
+};
 
 function Toast({ msg, type, onClose }) {
   useEffect(() => { const t = setTimeout(onClose, 4000); return () => clearTimeout(t); }, [onClose]);
   return (
-    <div className={`fixed top-5 right-5 z-[200] px-5 py-3 rounded-xl shadow-2xl text-sm font-bold max-w-sm
+    <div className={`fixed top-5 right-5 z-[300] px-5 py-3 rounded-xl shadow-2xl text-sm font-bold max-w-sm
       ${type === "error" ? "bg-red-600 text-white" : "bg-emerald-600 text-white"}`}>
       {msg}
     </div>
@@ -43,7 +56,7 @@ function Toast({ msg, type, onClose }) {
 
 export default function LoanDashboard() {
   const { user } = useAuth();
-  // views: dashboard | apply | detail | guarantors | guarantorHistory
+  // views: dashboard | apply | detail | guarantors | guarantorHistory | adminLoanTypes
   const [view, setView] = useState("dashboard");
   const [loans, setLoans]               = useState([]);
   const [loanTypes, setLoanTypes]       = useState([]);
@@ -57,14 +70,22 @@ export default function LoanDashboard() {
   const [toast, setToast]               = useState(null);
   const [loading, setLoading]           = useState(false);
   const [showRepaymentAccount, setShowRepaymentAccount] = useState(false);
+  const [showMyStatement, setShowMyStatement] = useState(false);
+  
+  // Real-time Notifications
+  const [notifications, setNotifications] = useState([]);
+  const [showNotesDrop, setShowNotesDrop] = useState(false);
 
-  // Apply flow
+  // Apply & Config flows
   const [step, setStep]               = useState(0);
   const [selectedType, setSelectedType] = useState(null);
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [form, setForm]               = useState({
-    amount: "", repayment_months: "", purpose: "",
-    matatu_id: "", supporting_doc: null, guarantor_ids: []
+    name: "", amount: "", repayment_months: "", purpose: "",
+    matatu_id: "", supporting_doc: null, guarantor_ids: [],
+    interest_rate: "", min_amount: "", max_amount: "", min_months: "", max_months: "", description: "",
+    repayment_frequency: "monthly", repayment_start_rule: "next_period",
+    penalty_type: "percentage", penalty_amount: 5, penalty_frequency: "monthly", grace_period_days: 3
   });
   const [calc, setCalc]               = useState(null);
   const [guarantorSearch, setGuarantorSearch]   = useState("");
@@ -84,14 +105,13 @@ export default function LoanDashboard() {
 
   const showToast = (msg, type = "success") => setToast({ msg, type });
 
-  // ── fetch ──────────────────────────────────────────────────────────────────
   useEffect(() => { fetchAll(); }, []);
 
   const fetchAll = async () => {
     await Promise.all([
       fetchLoans(), fetchLoanTypes(), fetchEligibility(),
       fetchGuarantorRequests(), fetchGuarantorHistory(),
-      fetchMembers(), fetchMatatus()
+      fetchMembers(), fetchMatatus(), fetchNotifications()
     ]);
   };
 
@@ -136,6 +156,16 @@ export default function LoanDashboard() {
     }
   };
 
+  const fetchNotifications = async () => {
+    const d = await authGet("/notifications/my");
+    if (Array.isArray(d)) setNotifications(d);
+  };
+
+  const markNotificationRead = async (id) => {
+    await authPut(`/notifications/${id}/read`);
+    fetchNotifications();
+  };
+
   const fetchLoanDetail = async (loan) => {
     setSelectedLoan(loan);
     const res = await fetch(`${API}/loan-payments/${loan.id}`, { headers: hdr() });
@@ -143,19 +173,25 @@ export default function LoanDashboard() {
     setView("detail");
   };
 
-  // ── calculations ───────────────────────────────────────────────────────────
+  // Calculations for dynamic Daily, Weekly, or Monthly loan payment plans
   useEffect(() => {
     if (selectedType && form.amount && form.repayment_months) {
       const amount = parseFloat(form.amount);
-      const months = parseInt(form.repayment_months);
+      const periods = parseInt(form.repayment_months);
       const rate   = selectedType.interest_rate;
-      const totalInterest = (amount * rate / 100) * (months / 12);
+      
+      let annualMultiplier = periods / 12; // default monthly representation
+      if (selectedType.repayment_frequency === "daily") annualMultiplier = periods / 365;
+      if (selectedType.repayment_frequency === "weekly") annualMultiplier = periods / 52;
+
+      const totalInterest = (amount * rate / 100) * annualMultiplier;
       const totalPayable  = amount + totalInterest;
-      const monthly       = totalPayable / months;
+      const singleInstallment = totalPayable / periods;
+
       setCalc({
         totalInterest: totalInterest.toFixed(2),
         totalPayable: totalPayable.toFixed(2),
-        monthly: monthly.toFixed(2),
+        monthly: singleInstallment.toFixed(2), // serves as 'per period payment'
         rate
       });
     } else {
@@ -163,7 +199,25 @@ export default function LoanDashboard() {
     }
   }, [form.amount, form.repayment_months, selectedType]);
 
-  // ── submit application ─────────────────────────────────────────────────────
+  const handleFileUpload = async (ltId, file) => {
+    if (!file) return;
+    const fd = new FormData();
+    fd.append("terms_file", file);
+    setLoading(true);
+    const res = await fetch(`${API}/loan-types/${ltId}/terms`, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${tok()}` },
+      body: fd
+    });
+    setLoading(false);
+    if (res.ok) {
+      showToast("Terms & Conditions uploaded successfully ✓");
+      fetchLoanTypes();
+    } else {
+      showToast("T&C Upload failed", "error");
+    }
+  };
+
   const submitApplication = async () => {
     setLoading(true);
     const fd = new FormData();
@@ -190,17 +244,17 @@ export default function LoanDashboard() {
     fetchAll();
   };
 
-  // ── guarantor response ─────────────────────────────────────────────────────
   const respondToGuarantor = async (id, status) => {
     const res = await fetch(`${API}/guarantors/${id}/respond`, {
       method: "PUT", headers: hdr(), body: JSON.stringify({ status })
     });
-    if (!res.ok) return showToast("Failed", "error");
+    if (!res.ok) return showToast("Failed to record decision", "error");
     showToast(`Guarantor request ${status} ✓`);
-    fetchGuarantorRequests(); fetchGuarantorHistory();
+    fetchGuarantorRequests(); 
+    fetchGuarantorHistory();
+    setView("dashboard");
   };
 
-  // ── make payment ───────────────────────────────────────────────────────────
   const makePayment = async () => {
     if (!payForm.amount) return showToast("Amount required", "error");
     setLoading(true);
@@ -217,14 +271,12 @@ export default function LoanDashboard() {
     });
     setLoading(false);
     if (!res.ok) return showToast("Payment failed", "error");
-    const d = await res.json();
-    showToast(`Payment recorded! Balance: KES ${d.balance?.toLocaleString()} ✓`);
+    showToast(`Payment recorded for approval! KES ${parseFloat(payForm.amount).toLocaleString()} ✓`);
     setShowPayModal(false);
     setPayForm({ amount:"", payment_method:"cash", mpesa_code:"", date:new Date().toISOString().split("T")[0], proof_file:null });
     fetchLoans();
   };
 
-  // ── respond to info_required ───────────────────────────────────────────────
   const sendInfoResponse = async () => {
     if (!infoResponse.trim()) return showToast("Please provide your response", "error");
     setSendingInfo(true);
@@ -243,7 +295,6 @@ export default function LoanDashboard() {
     if (updated) setSelectedLoan(updated);
   };
 
-  // ── helpers ────────────────────────────────────────────────────────────────
   const addGuarantor = (m) => {
     if (form.guarantor_ids.includes(m.id)) return showToast("Already added", "error");
     if (form.guarantor_ids.length >= 3)    return showToast("Maximum 3 guarantors", "error");
@@ -260,12 +311,11 @@ export default function LoanDashboard() {
   const totalBorrowed = loans.filter(l => l.status === "cleared").reduce((s,l) => s + l.amount, 0);
 
   const GUARANTEE_STATUS = {
-    pending:  { color:"bg-yellow-100 text-yellow-700", icon:"⏳" },
-    accepted: { color:"bg-green-100 text-green-700",   icon:"✅" },
-    rejected: { color:"bg-red-100 text-red-700",       icon:"❌" },
+    pending:  { color:"bg-yellow-100 text-yellow-800 border-yellow-300", icon:"⏳", label:"Pending" },
+    accepted: { color:"bg-green-100 text-green-700 border-green-300",   icon:"✅", label:"Accepted" },
+    rejected: { color:"bg-red-100 text-red-700 border-red-200",         icon:"❌", label:"Rejected" },
   };
 
-  // ── RENDER ─────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-50">
       {toast && <Toast {...toast} onClose={() => setToast(null)} />}
@@ -291,17 +341,77 @@ export default function LoanDashboard() {
                 ← Back to Loan Dashboard
               </button>
             )}
-            <h1 className="text-2xl font-black text-gray-900">
+            <h1 className="text-2xl font-black text-gray-900 font-bold">
               {view === "dashboard"      && "💼 Loan Dashboard"}
               {view === "apply"          && "📝 Apply for a Loan"}
               {view === "detail"         && `Loan #${selectedLoan?.id} Details`}
               {view === "guarantors"     && "🤝 Pending Guarantor Requests"}
               {view === "guarantorHistory" && "🤝 My Guarantor History"}
+              {view === "adminLoanTypes"  && "⚙️ Manage Configure Loan Types"}
             </h1>
           </div>
 
           {view === "dashboard" && (
-            <div className="flex gap-2 flex-wrap">
+            <div className="flex gap-2 flex-wrap items-center">
+              
+              {/* High Contrast, Fully Readable Notifications Panel */}
+              <div className="relative z-50">
+                <button onClick={() => setShowNotesDrop(!showNotesDrop)}
+                  className="bg-white border border-gray-300 text-slate-800 font-extrabold px-4 py-2 rounded-lg text-sm hover:bg-slate-100 flex items-center gap-1.5 relative shadow-sm">
+                  🔔 Notifications
+                  {notifications.filter(n => !n.is_read).length > 0 && (
+                    <span className="absolute -top-1 -right-1 bg-red-600 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs animate-pulse font-black">
+                      {notifications.filter(n => !n.is_read).length}
+                    </span>
+                  )}
+                </button>
+                
+                {showNotesDrop && (
+                   <div className="absolute left-0 mt-2 w-[calc(100vw-2rem)] sm:w-96 bg-white border border-gray-300 rounded-xl shadow-2xl z-[999] overflow-hidden flex flex-col">
+                    <div className="bg-slate-100 border-b border-gray-200 p-3 flex justify-between items-center">
+                      <span className="font-bold text-sm text-slate-900">In-App Alerts</span>
+                      {notifications.filter(n => !n.is_read).length > 0 && (
+                        <button onClick={async () => {
+                          await authPut("/notifications/read-all");
+                          fetchNotifications();
+                        }} className="text-xs text-blue-700 font-bold hover:underline">Mark all read</button>
+                      )}
+                    </div>
+                    <div className="overflow-y-auto flex-1 divide-y divide-gray-200 max-h-80">
+                      {notifications.length === 0 ? (
+                        <p className="p-8 text-center text-gray-500 text-sm font-semibold">No notifications yet</p>
+                      ) : (
+                        notifications.map(n => (
+                          <div key={n.id} className={`p-4 transition-colors hover:bg-slate-50 flex flex-col gap-1.5 ${!n.is_read ? "bg-blue-50 border-l-4 border-blue-600" : "border-l-4 border-transparent"}`}>
+                            <div className="flex justify-between items-start gap-2">
+                              <span className="font-extrabold text-sm text-slate-900">{n.title}</span>
+                              {!n.is_read && (
+                                <button onClick={() => markNotificationRead(n.id)} className="text-xs text-blue-700 font-extrabold hover:underline whitespace-nowrap bg-blue-100 px-2 py-0.5 rounded">
+                                  Mark Read
+                                </button>
+                              )}
+                            </div>
+                            <p className="text-sm text-slate-800 leading-relaxed font-semibold break-words">
+                              {n.message}
+                            </p>
+                            <div className="flex justify-between items-center text-xs text-slate-500 mt-1 font-semibold">
+                              <span className="bg-slate-100 px-2 py-0.5 rounded text-slate-700 font-bold">{n.sender_name}</span>
+                              <span>{new Date(n.created_at).toLocaleDateString()}</span>
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {["hr", "admin", "director"].includes(user?.role) && (
+                <button onClick={() => { setView("adminLoanTypes"); setSelectedType(null); }}
+                  className="bg-purple-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-purple-700">
+                  ⚙️ Admin: Rules Portal
+                </button>
+              )}
               <button onClick={() => setView("guarantorHistory")}
                 className="bg-slate-100 text-slate-700 font-bold px-4 py-2 rounded-lg text-sm hover:bg-slate-200">
                 🤝 Guarantor History
@@ -329,14 +439,14 @@ export default function LoanDashboard() {
         {view === "dashboard" && (
           <div className="space-y-6">
 
-            {/* Eligibility */}
+            {/* Eligibility Card */}
             {eligibility && (
               <div className={`rounded-xl p-5 border ${eligibility.eligible ? "bg-emerald-50 border-emerald-200" : "bg-red-50 border-red-200"}`}>
                 <div className="flex items-start justify-between">
                   <div>
                     <div className="flex items-center gap-2 mb-2">
                       <span className="text-xl">{eligibility.eligible ? "✅" : "❌"}</span>
-                      <h3 className="font-black text-gray-800">{eligibility.eligible ? "You are eligible to apply" : "Currently not eligible"}</h3>
+                      <h3 className="font-black text-gray-800 font-bold">{eligibility.eligible ? "You are eligible to apply" : "Currently not eligible"}</h3>
                     </div>
                     {eligibility.reasons?.length > 0 && (
                       <ul className="space-y-1">
@@ -345,25 +455,66 @@ export default function LoanDashboard() {
                     )}
                   </div>
                   <div className="text-right ml-4 flex-shrink-0">
-                    <p className="text-xs text-gray-500 mb-1">Max Eligible Amount</p>
-                    <p className="text-2xl font-black text-emerald-700">KES {eligibility.max_eligible_amount?.toLocaleString()}</p>
+                    <p className="text-xs text-gray-500 mb-1 font-bold">Max Eligible Amount</p>
+                    <p className="text-2xl font-black text-emerald-700 font-bold">KES {eligibility.max_eligible_amount?.toLocaleString()}</p>
                   </div>
-                </div>
-                <div className="grid grid-cols-3 gap-3 mt-4 pt-3 border-t border-opacity-30"
-                  style={{ borderColor: eligibility.eligible ? "#6EE7B7" : "#FCA5A5" }}>
-                  {[["Savings",`KES ${eligibility.total_savings?.toLocaleString()||0}`],
-                    ["Contributions",`KES ${eligibility.total_contributions?.toLocaleString()||0}`],
-                    ["Past Loans",eligibility.past_loans||0]].map(([l,v],i) => (
-                    <div key={i} className="text-center">
-                      <p className="text-xs text-gray-500">{l}</p>
-                      <p className="font-black text-gray-800 text-sm">{v}</p>
-                    </div>
-                  ))}
                 </div>
               </div>
             )}
 
-            {/* Stats */}
+            {/* HIGH-PRIORITY BORROWER COMMITMENT PROMPT CARD (Home Screen Portal Visibility) */}
+            {activeLoan?.rate_change_pending && (
+              <div className="bg-blue-50 border-2 border-blue-300 rounded-2xl p-5 shadow-lg space-y-4">
+                <div className="flex items-center gap-2 text-blue-900 border-b border-blue-100 pb-2">
+                  <span className="text-2xl">📢</span>
+                  <h3 className="font-black text-base font-bold text-slate-800">Attention Required: Sacco Rate Modification Notice</h3>
+                </div>
+                <p className="text-sm text-slate-700 leading-relaxed font-semibold bg-white/75 p-4 rounded-xl border border-blue-200">
+                  {activeLoan.rate_change_notes}
+                </p>
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    onClick={async () => {
+                      if (!window.confirm("Do you agree to accept these revised terms and update your active schedules?")) return;
+                      setLoading(true);
+                      const res = await authPut(`/loan-applications/${activeLoan.id}/commitment`, { status: "agreed" });
+                      setLoading(false);
+                      if (res.ok) {
+                        showToast("Commitment agreement accepted successfully ✓");
+                        fetchAll();
+                      } else {
+                        showToast("Agreement action failed", "error");
+                      }
+                    }}
+                    disabled={loading}
+                    className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-black px-4 py-2.5 rounded-lg shadow-sm"
+                  >
+                    {loading ? "Processing..." : "✅ Agree & Accept New Terms"}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const reason = prompt("State your reason for declining these revised loan terms:");
+                      if (reason === null) return; // borrower cancelled prompt
+                      setLoading(true);
+                      const res = await authPut(`/loan-applications/${activeLoan.id}/commitment`, { status: "disagreed", reason });
+                      setLoading(false);
+                      if (res.ok) {
+                        showToast("Decline notification sent back to HR/Admin ✓");
+                        fetchAll();
+                      } else {
+                        showToast("Action failed", "error");
+                      }
+                    }}
+                    disabled={loading}
+                    className="bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 text-xs font-black px-4 py-2.5 rounded-lg"
+                  >
+                    ❌ Disagree & Request Review
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Stats Cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               {[
                 { label:"Active Loan",    value:activeLoan?`KES ${activeLoan.amount?.toLocaleString()}`:"None",                                           icon:"💰", color:"bg-blue-50 border-blue-200" },
@@ -374,57 +525,67 @@ export default function LoanDashboard() {
                 <div key={i} className={`border rounded-xl p-4 ${s.color}`}>
                   <span className="text-2xl">{s.icon}</span>
                   <p className="text-xs text-gray-500 mt-1">{s.label}</p>
-                  <p className="font-black text-gray-800 text-sm mt-0.5">{s.value}</p>
+                  <p className="font-black text-gray-800 text-sm mt-0.5 font-bold">{s.value}</p>
                 </div>
               ))}
             </div>
 
-            {/* Active loan progress */}
+            {/* Active Loan Progress Card */}
             {activeLoan && (
-              <div className="bg-white border border-gray-200 rounded-xl p-5">
+              <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
                 <div className="flex justify-between items-start mb-4">
                   <div>
-                    <h3 className="font-black text-gray-800">Active Loan — {activeLoan.loan_type}</h3>
+                    <h3 className="font-black text-gray-800 font-bold">Active Loan — {activeLoan.loan_type || "Standard Loan"}</h3>
                     <p className="text-gray-500 text-sm">{activeLoan.purpose}</p>
                   </div>
-                  <span className={`text-xs px-3 py-1 rounded-full font-bold border ${STATUS_CONFIG[activeLoan.status]?.color}`}>
-                    {STATUS_CONFIG[activeLoan.status]?.icon} {STATUS_CONFIG[activeLoan.status]?.label}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-xs px-3 py-1 rounded-full font-bold border ${STATUS_CONFIG[activeLoan.status]?.color || "bg-blue-100 text-blue-800"}`}>
+                      {STATUS_CONFIG[activeLoan.status]?.icon || "🔄"} {STATUS_CONFIG[activeLoan.status]?.label || activeLoan.status}
+                    </span>
+                    {isPreexistingLoan(activeLoan) && (
+                      <span className="text-xs px-2.5 py-1 rounded-full font-bold bg-slate-100 text-slate-700 border border-slate-300">
+                        Pre-existing
+                      </span>
+                    )}
+                  </div>
                 </div>
+
                 <div className="grid grid-cols-3 gap-4 mb-4 text-sm">
-                  <div><p className="text-gray-400">Loan Amount</p><p className="font-black">KES {activeLoan.amount?.toLocaleString()}</p></div>
-                  <div><p className="text-gray-400">Repaid</p><p className="font-black text-green-600">KES {activeLoan.amount_repaid?.toLocaleString()}</p></div>
-                  <div><p className="text-gray-400">Balance</p><p className="font-black text-red-600">KES {(activeLoan.total_payable-activeLoan.amount_repaid)?.toLocaleString()}</p></div>
+                  <div><p className="text-gray-400 text-xs font-semibold">Loan Amount</p><p className="font-black font-bold">KES {activeLoan.amount?.toLocaleString()}</p></div>
+                  <div><p className="text-gray-400 text-xs font-semibold">Repaid</p><p className="font-black text-green-600 font-bold">KES {activeLoan.amount_repaid?.toLocaleString()}</p></div>
+                  <div><p className="text-gray-400 text-xs font-semibold">Balance</p><p className="font-black text-red-600 font-bold">KES {(activeLoan.total_payable - activeLoan.amount_repaid)?.toLocaleString()}</p></div>
                 </div>
+
                 <div className="w-full bg-gray-100 rounded-full h-3 mb-4">
                   <div className="h-3 rounded-full bg-emerald-500 transition-all duration-700"
-                    style={{ width:`${Math.min((activeLoan.amount_repaid/activeLoan.total_payable)*100,100)}%` }} />
+                    style={{ width: `${Math.min(((activeLoan.amount_repaid || 0) / (activeLoan.total_payable || 1)) * 100, 100)}%` }} />
                 </div>
 
-                {/* Info required alert */}
-                {activeLoan.status === "info_required" && (
-                  <div className="bg-orange-50 border border-orange-300 rounded-lg p-3 mb-3">
-                    <p className="text-orange-700 font-bold text-sm">ℹ️ More Information Required</p>
-                    <p className="text-orange-600 text-xs mt-1">{activeLoan.admin_notes || "HR/Admin has requested additional information."}</p>
-                    <button onClick={() => fetchLoanDetail(activeLoan)} className="mt-2 bg-orange-500 text-white font-bold text-xs px-3 py-1.5 rounded hover:bg-orange-600">
-                      → Provide Information
-                    </button>
-                  </div>
-                )}
-
-                <div className="flex gap-2 flex-wrap">
-                  <button onClick={() => fetchLoanDetail(activeLoan)} className="bg-gray-100 text-gray-700 font-bold px-4 py-2 rounded-lg text-sm hover:bg-gray-200">View Details</button>
-                  {["approved","disbursed","repaying"].includes(activeLoan.status) && (
-                    <button onClick={() => { setSelectedLoan(activeLoan); setShowPayModal(true); }}
-                      className="bg-emerald-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-emerald-700">💳 Make Payment</button>
+               <div className="flex gap-2 flex-wrap">
+                  <button onClick={() => fetchLoanDetail(activeLoan)} className="bg-gray-100 text-gray-700 font-bold px-4 py-2 rounded-lg text-sm hover:bg-gray-200">
+                    View Schedule & Logs
+                  </button>
+                  {["approved", "disbursed", "repaying", "active", "defaulted"].includes(activeLoan.status) && (
+                    <>
+                      {activeLoan.penalty > 0 && activeLoan.penalty_status !== "pending_approval" ? (
+                        <div className="text-red-700 text-xs font-bold bg-red-50 border border-red-200 px-3 py-2 rounded-lg">
+                          ⚠️ Standard payments are blocked due to an active penalty. Open 'View Schedule & Logs' to clear it.
+                        </div>
+                      ) : (
+                        <button onClick={() => { setSelectedLoan(activeLoan); setShowPayModal(true); }}
+                          className="bg-emerald-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-emerald-700">
+                          💳 Make Payment
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               </div>
             )}
 
-            {/* Loan history */}
+            {/* History Table */}
             <div>
-              <h3 className="font-black text-gray-700 mb-3">Loan History</h3>
+              <h3 className="font-black text-gray-700 mb-3 font-bold">Loan History</h3>
               {loans.length === 0 ? (
                 <div className="bg-white border border-gray-200 rounded-xl p-8 text-center text-gray-400">
                   <p className="text-4xl mb-2">📋</p>
@@ -436,24 +597,18 @@ export default function LoanDashboard() {
                     <div key={loan.id} onClick={() => fetchLoanDetail(loan)}
                       className="bg-white border border-gray-200 rounded-xl p-4 cursor-pointer hover:border-emerald-400 hover:shadow-sm transition-all flex justify-between items-center">
                       <div>
-                        <div className="flex items-center gap-2 mb-1">
-                          <p className="font-black text-gray-800">KES {loan.amount?.toLocaleString()}</p>
-                          <span className={`text-xs px-2 py-0.5 rounded-full font-bold border ${STATUS_CONFIG[loan.status]?.color}`}>
-                            {STATUS_CONFIG[loan.status]?.icon} {STATUS_CONFIG[loan.status]?.label}
+                        <div className="flex items-center gap-2 mb-1 flex-wrap">
+                          <p className="font-black text-gray-800 font-bold">KES {loan.amount?.toLocaleString()}</p>
+                          <span className={`text-xs px-2 py-0.5 rounded-full font-bold border ${STATUS_CONFIG[loan.status]?.color || "bg-gray-100 text-gray-700 border-gray-200"}`}>
+                            {STATUS_CONFIG[loan.status]?.icon} {STATUS_CONFIG[loan.status]?.label || loan.status}
                           </span>
                         </div>
-                        <p className="text-sm text-gray-500">{loan.loan_type} · {loan.purpose}</p>
-                        {loan.status === "rejected" && loan.admin_notes && (
-                          <p className="text-xs text-red-600 mt-1 font-bold">Reason: {loan.admin_notes}</p>
-                        )}
-                        {loan.status === "info_required" && loan.admin_notes && (
-                          <p className="text-xs text-orange-600 mt-1">⚠️ {loan.admin_notes}</p>
-                        )}
-                        <p className="text-xs text-gray-400">{new Date(loan.created_at).toLocaleDateString()}</p>
+                        <p className="text-sm text-gray-500 font-semibold">{loan.loan_type} · {loan.purpose}</p>
+                        <p className="text-xs text-gray-400 font-semibold">{new Date(loan.created_at).toLocaleDateString()}</p>
                       </div>
                       <div className="text-right">
-                        <p className="text-xs text-gray-400">Balance</p>
-                        <p className="font-black text-gray-700">KES {(loan.total_payable-loan.amount_repaid)?.toLocaleString()}</p>
+                        <p className="text-xs text-gray-400 font-bold">Balance</p>
+                        <p className="font-black text-gray-700 font-bold">KES {(loan.total_payable - loan.amount_repaid)?.toLocaleString()}</p>
                       </div>
                     </div>
                   ))}
@@ -463,10 +618,9 @@ export default function LoanDashboard() {
           </div>
         )}
 
-        {/* ═══════════════════════════════ APPLY ═══════════════════════════════ */}
+        {/* ═══════════════════════════════ APPLY FLOW ═════════════════════════ */}
         {view === "apply" && (
           <div>
-            {/* Step indicator */}
             <div className="flex items-center mb-8 overflow-x-auto pb-2">
               {STEPS.map((s,i) => (
                 <div key={i} className="flex items-center flex-shrink-0">
@@ -480,85 +634,63 @@ export default function LoanDashboard() {
               ))}
             </div>
 
-            {/* STEP 0: Loan Type */}
+            {/* STEP 0: Select Loan Type */}
             {step === 0 && (
               <div>
-                <h2 className="text-xl font-black text-gray-800 mb-4">Select Loan Type</h2>
-                {loanTypes.length === 0 ? (
-                  <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-6 text-center text-yellow-700">
-                    No loan types configured yet. Contact HR/Admin.
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {loanTypes.map(lt => (
-                      <div key={lt.id} onClick={() => { setSelectedType(lt); setTermsAccepted(false); setStep(1); }}
-                        className="border-2 rounded-xl p-5 cursor-pointer transition-all hover:shadow-md bg-white border-gray-200 hover:border-emerald-300">
-                        <h3 className="font-black text-gray-800 text-lg">{lt.name}</h3>
-                        <p className="text-gray-500 text-sm mt-1">{lt.description}</p>
-                        <div className="mt-4 space-y-1 text-sm">
-                          <div className="flex justify-between"><span className="text-gray-400">Interest</span><span className="font-bold text-emerald-700">{lt.interest_rate}% p.a.</span></div>
-                          <div className="flex justify-between"><span className="text-gray-400">Min</span><span className="font-bold">KES {lt.min_amount?.toLocaleString()}</span></div>
-                          <div className="flex justify-between"><span className="text-gray-400">Max</span><span className="font-bold">KES {lt.max_amount?.toLocaleString()}</span></div>
-                          <div className="flex justify-between"><span className="text-gray-400">Term</span><span className="font-bold">{lt.min_months}–{lt.max_months} months</span></div>
-                          {lt.penalty_rate != null && (
-                            <div className="flex justify-between"><span className="text-gray-400">Late penalty</span><span className="font-bold text-red-600">{lt.penalty_rate}%</span></div>
-                          )}
-                        </div>
-                        {lt.terms_file && (
-                          <a href={lt.terms_file} target="_blank" rel="noreferrer"
-                            onClick={e => e.stopPropagation()}
-                            className="mt-3 flex items-center gap-1 text-xs text-blue-600 hover:underline font-bold">
-                            📄 View Terms & Conditions
-                          </a>
-                        )}
-                        <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-lg py-1 text-center text-xs text-emerald-700 font-bold">
-                          Select this type →
+                <h2 className="text-xl font-black text-gray-800 mb-4 font-bold">Select Loan Type</h2>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {loanTypes.map(lt => (
+                    <div key={lt.id} onClick={() => { setSelectedType(lt); setTermsAccepted(false); setStep(1); }}
+                      className="border-2 rounded-xl p-5 cursor-pointer transition-all hover:shadow-md bg-white border-gray-200 hover:border-emerald-300">
+                      <h3 className="font-black text-gray-800 text-lg font-bold">{lt.name}</h3>
+                      <p className="text-gray-500 text-sm mt-1 font-semibold">{lt.description}</p>
+                      <div className="mt-4 space-y-1.5 text-sm border-t border-gray-100 pt-3">
+                        <div className="flex justify-between"><span className="text-gray-400 font-bold">Interest</span><span className="font-bold text-emerald-700">{lt.interest_rate}% p.a.</span></div>
+                        <div className="flex justify-between"><span className="text-gray-400 font-bold">Limits</span><span className="font-bold">KES {lt.min_amount?.toLocaleString()} - {lt.max_amount?.toLocaleString()}</span></div>
+                        <div className="flex justify-between"><span className="text-gray-400 font-bold">Frequencies</span><span className="font-bold capitalize">{lt.repayment_frequency || "monthly"}</span></div>
+                        <div className="flex justify-between"><span className="text-gray-400 font-bold">Grace Period</span><span className="font-bold">{lt.grace_period_days || 3} Days</span></div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-400 font-bold">Rule Type</span>
+                          <span className="font-bold text-xs capitalize text-blue-600 font-extrabold">
+                            {lt.repayment_start_rule === "same_day" ? "Same day as approval" : "Standard next period"}
+                          </span>
                         </div>
                       </div>
-                    ))}
-                  </div>
-                )}
+                      <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-lg py-1.5 text-center text-xs text-emerald-700 font-bold">
+                        Choose {lt.name} →
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 
-            {/* STEP 1: Terms & Conditions */}
+            {/* STEP 1: Terms & Conditions Document Verification */}
             {step === 1 && selectedType && (
               <div className="max-w-2xl">
-                <h2 className="text-xl font-black text-gray-800 mb-1">Terms & Conditions</h2>
+                <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Terms & Conditions Agreement</h2>
                 <p className="text-gray-500 text-sm mb-4">
-                  Please read and accept the terms for <span className="font-bold text-gray-700">{selectedType.name}</span>.
+                  Review the customized regulatory rules for <span className="font-bold text-gray-700">{selectedType.name}</span>.
                 </p>
 
                 <div className="bg-white border border-gray-200 rounded-xl p-5 mb-4">
                   {selectedType.terms_file ? (
-                    <>
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
-                        <p className="text-blue-700 font-bold text-sm mb-2">📄 Official Terms & Conditions Document</p>
-                        <p className="text-blue-600 text-xs mb-3">You must read the full terms before proceeding with your application.</p>
-                        <a href={selectedType.terms_file} target="_blank" rel="noreferrer"
-                          className="inline-flex items-center gap-2 bg-blue-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-blue-700">
-                          📖 Open Terms & Conditions
-                        </a>
-                      </div>
-                    </>
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 mb-4">
+                      <p className="text-blue-700 font-bold text-sm mb-2">📄 Read Terms & Conditions Document</p>
+                      <p className="text-blue-600 text-xs mb-3 font-semibold">An official document has been linked by HR. Open it below to read the complete rules.</p>
+                      <a href={selectedType.terms_file} target="_blank" rel="noreferrer"
+                        className="inline-flex items-center gap-2 bg-blue-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-blue-700 shadow-sm">
+                        📖 View Terms (PDF / Image)
+                      </a>
+                    </div>
                   ) : (
-                    <div className="bg-gray-50 rounded-lg p-4 mb-4 text-sm text-gray-600">
-                      <p className="font-bold text-gray-800 mb-2">Standard SACCO Loan Terms — {selectedType.name}</p>
-                      <ul className="space-y-1.5 text-xs">
-                        <li>• Loan amount: KES {selectedType.min_amount?.toLocaleString()} – KES {selectedType.max_amount?.toLocaleString()}</li>
-                        <li>• Interest rate: {selectedType.interest_rate}% per annum, calculated on reducing balance</li>
-                        <li>• Repayment period: {selectedType.min_months} – {selectedType.max_months} months</li>
-                        {selectedType.penalty_rate != null && (
-                          <li>• Late payment penalty: {selectedType.penalty_rate}% of outstanding installment</li>
-                        )}
-                        {selectedType.grace_period_days != null && (
-                          <li>• Grace period: {selectedType.grace_period_days} days before penalty applies</li>
-                        )}
-                        {selectedType.penalty_description && <li>• {selectedType.penalty_description}</li>}
-                        <li>• 2–3 guarantors required from active SACCO members</li>
-                        <li>• Loan proceeds will be disbursed after admin approval</li>
-                        <li>• Defaulting may result in guarantors becoming liable</li>
-                        <li>• SACCO reserves the right to deduct repayments from member savings</li>
+                    <div className="bg-gray-50 rounded-lg p-4 mb-4 text-sm text-gray-600 space-y-2">
+                      <p className="font-bold text-gray-800">Dynamic Schedule Regulations</p>
+                      <ul className="space-y-1 text-xs font-semibold">
+                        <li>• Custom Limits: KES {selectedType.min_amount?.toLocaleString()} – KES {selectedType.max_amount?.toLocaleString()}</li>
+                        <li>• Repayment Frequency: Paid <span className="text-emerald-700 capitalize">{selectedType.repayment_frequency}</span></li>
+                        <li>• Start Date Policy: {selectedType.repayment_start_rule === "same_day" ? "Schedules activate on the exact day of borrowing / approval" : "First payment occurs at the end of the first cycle"}</li>
+                        <li>• Penalty Rule: {selectedType.penalty_amount}% ({selectedType.penalty_type}) late fees apply following a {selectedType.grace_period_days}-day grace period</li>
                       </ul>
                     </div>
                   )}
@@ -566,9 +698,8 @@ export default function LoanDashboard() {
                   <label className="flex items-start gap-3 cursor-pointer mt-4">
                     <input type="checkbox" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)}
                       className="mt-0.5 w-5 h-5 rounded accent-emerald-600 flex-shrink-0" />
-                    <span className="text-sm text-gray-700">
-                      I have read and understood the Terms & Conditions for <strong>{selectedType.name}</strong>.
-                      I agree to abide by all terms and understand the penalty structure for missed payments.
+                    <span className="text-sm text-gray-700 font-bold">
+                      I confirm I have opened, read, and accepted all Terms & Conditions. I understand the repayment cycles and late penalty fees.
                     </span>
                   </label>
                 </div>
@@ -585,87 +716,57 @@ export default function LoanDashboard() {
               </div>
             )}
 
-            {/* STEP 2: Loan Details */}
+            {/* STEP 2: Calculate Repayment Rates & Details */}
             {step === 2 && selectedType && (
               <div className="max-w-2xl">
-                <h2 className="text-xl font-black text-gray-800 mb-1">Loan Details</h2>
-                <p className="text-gray-400 text-sm mb-6">
-                  Type: <span className="font-bold text-gray-700">{selectedType.name}</span> ·
-                  Rate: <span className="font-bold text-emerald-600">{selectedType.interest_rate}% p.a.</span>
+                <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Enter Application Details</h2>
+                <p className="text-gray-400 text-sm mb-6 font-semibold">
+                  Repayment Cycle: <span className="font-bold text-emerald-600 capitalize">{selectedType.repayment_frequency}</span> · 
+                  Start Date: <span className="font-bold text-blue-600 capitalize">{selectedType.repayment_start_rule?.replace("_", " ")}</span>
                 </p>
 
                 <div className="space-y-4 bg-white border border-gray-200 rounded-xl p-6 mb-4">
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">
-                        Loan Amount (KES) <span className="text-red-500">*</span>
-                      </label>
+                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Requested Loan Amount (KES)</label>
                       <input type="number" placeholder={`${selectedType.min_amount}–${selectedType.max_amount}`}
                         value={form.amount} onChange={e => setForm({...form, amount:e.target.value})}
-                        min={selectedType.min_amount} max={selectedType.max_amount}
-                        className={inp} />
+                        min={selectedType.min_amount} max={selectedType.max_amount} className={inp} />
                     </div>
                     <div>
-                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">
-                        Repayment Period (Months) <span className="text-red-500">*</span>
-                      </label>
+                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Number of Installments ({selectedType.repayment_frequency})</label>
                       <input type="number" placeholder={`${selectedType.min_months}–${selectedType.max_months}`}
                         value={form.repayment_months} onChange={e => setForm({...form, repayment_months:e.target.value})}
-                        min={selectedType.min_months} max={selectedType.max_months}
-                        className={inp} />
+                        min={selectedType.min_months} max={selectedType.max_months} className={inp} />
                     </div>
                   </div>
+
                   <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">
-                      Purpose / Reason <span className="text-red-500">*</span>
-                    </label>
-                    <textarea placeholder="Explain what this loan will be used for..."
-                      value={form.purpose} onChange={e => setForm({...form, purpose:e.target.value})} rows={3}
-                      className={textArea} />
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">
-                      Link to Matatu (optional)
-                    </label>
-                    <select value={form.matatu_id} onChange={e => setForm({...form, matatu_id:e.target.value})}
-                      className={inp}>
-                      <option value="">Not linked to a matatu</option>
-                      {matatus.map(m => <option key={m.id} value={m.id}>{m.plate}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">
-                      Supporting Documents (optional)
-                    </label>
-                    <input type="file" accept="image/*,.pdf"
-                      onChange={e => setForm({...form, supporting_doc:e.target.files[0]})}
-                      className="w-full border border-gray-300 rounded-lg p-3 text-sm bg-white text-gray-700 file:mr-3 file:bg-emerald-600 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold file:text-xs" />
+                    <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Explanation / Purpose</label>
+                    <textarea placeholder="Write reason for loan application..."
+                      value={form.purpose} onChange={e => setForm({...form, purpose:e.target.value})} rows={3} className={textArea} />
                   </div>
                 </div>
 
-                {/* Calculations */}
                 {calc && (
                   <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-5 mb-4">
-                    <h4 className="font-black text-emerald-800 mb-3">📊 Loan Calculations</h4>
+                    <h4 className="font-black text-emerald-800 mb-3 font-bold">📊 Schedule Preview Plan</h4>
                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                       {[
                         ["Principal",       `KES ${parseFloat(form.amount)?.toLocaleString()}`],
                         ["Interest",        `KES ${parseFloat(calc.totalInterest)?.toLocaleString()}`],
                         ["Total Payable",   `KES ${parseFloat(calc.totalPayable)?.toLocaleString()}`],
-                        ["Monthly Payment", `KES ${parseFloat(calc.monthly)?.toLocaleString()}`],
+                        ["Per Installment", `KES ${parseFloat(calc.monthly)?.toLocaleString()}`],
                       ].map(([l,v],i) => (
                         <div key={i} className="bg-white rounded-lg p-3 text-center">
-                          <p className="text-xs text-gray-400">{l}</p>
-                          <p className="font-black text-emerald-700 text-sm">{v}</p>
+                          <p className="text-xs text-gray-400 font-bold">{l}</p>
+                          <p className="font-black text-emerald-700 text-sm font-bold">{v}</p>
                         </div>
                       ))}
                     </div>
-                    {selectedType.penalty_rate != null && (
-                      <p className="text-xs text-red-600 mt-3 font-semibold">
-                        ⚠️ Late payment penalty: {selectedType.penalty_rate}% per missed installment
-                        {selectedType.grace_period_days ? ` (after ${selectedType.grace_period_days}-day grace period)` : ""}
-                      </p>
-                    )}
+                    <p className="text-xs text-emerald-800 font-semibold mt-3">
+                      💡 Payments can be made at any point. Pre-paying multiple intervals moves your due period forward automatically.
+                    </p>
                   </div>
                 )}
 
@@ -681,66 +782,45 @@ export default function LoanDashboard() {
               </div>
             )}
 
-            {/* STEP 3: Guarantors */}
+            {/* STEP 3 & 4 (Add Guarantors and Review) */}
             {step === 3 && (
               <div className="max-w-2xl">
-                <h2 className="text-xl font-black text-gray-800 mb-1">Select Guarantors</h2>
-                <p className="text-gray-400 text-sm mb-6">Add 2–3 active SACCO members as guarantors. They must accept before your loan is reviewed.</p>
-
-                {/* Loan summary */}
-                <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 mb-6">
-                  <h4 className="font-bold text-gray-600 text-xs uppercase tracking-widest mb-3">Loan Summary</h4>
-                  <div className="grid grid-cols-2 gap-2 text-sm">
-                    <div><span className="text-gray-400">Type:</span> <span className="font-bold">{selectedType?.name}</span></div>
-                    <div><span className="text-gray-400">Amount:</span> <span className="font-bold">KES {parseFloat(form.amount)?.toLocaleString()}</span></div>
-                    <div><span className="text-gray-400">Monthly:</span> <span className="font-bold text-emerald-600">KES {parseFloat(calc?.monthly)?.toLocaleString()}</span></div>
-                    <div><span className="text-gray-400">Total:</span> <span className="font-bold">KES {parseFloat(calc?.totalPayable)?.toLocaleString()}</span></div>
-                    <div className="col-span-2"><span className="text-gray-400">Purpose:</span> <span className="font-medium">{form.purpose}</span></div>
-                  </div>
-                </div>
+                <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Select Guarantors</h2>
+                <p className="text-gray-400 text-sm mb-6 font-semibold">Assign 2–3 active SACCO members as guarantors.</p>
 
                 <div className="bg-white border border-gray-200 rounded-xl p-5 mb-4">
-                  <h4 className="font-black text-gray-700 mb-3">Add Guarantors ({form.guarantor_ids.length}/3)</h4>
+                  <h4 className="font-black text-gray-700 mb-3 font-bold">Add Guarantors ({form.guarantor_ids.length}/3)</h4>
                   <div className="relative mb-4">
-                    <input type="text" placeholder="Search member by name or membership no..."
+                    <input type="text" placeholder="Search by name or member ID..."
                       value={guarantorSearch}
                       onChange={e => { setGuarantorSearch(e.target.value); setShowGuarantorDrop(true); }}
-                      onFocus={() => setShowGuarantorDrop(true)}
                       className={inp} />
                     {showGuarantorDrop && guarantorSearch && (
                       <div className="absolute z-50 bg-white border border-gray-200 w-full max-h-48 overflow-y-auto shadow-lg rounded-lg mt-1">
-                        {filteredMembers.filter(m => !form.guarantor_ids.includes(m.id)).length > 0
-                          ? filteredMembers.filter(m => !form.guarantor_ids.includes(m.id)).map(m => (
-                            <div key={m.id} onClick={() => addGuarantor(m)}
-                              className="p-3 hover:bg-emerald-50 cursor-pointer border-b border-gray-100">
-                              <p className="font-bold text-sm text-gray-800">{m.name}</p>
-                              <p className="text-xs text-gray-400">{m.membership_no} · <span className="capitalize">{m.role}</span></p>
-                            </div>
-                          ))
-                          : <p className="p-3 text-gray-400 text-sm">No members found</p>
-                        }
+                        {filteredMembers.filter(m => !form.guarantor_ids.includes(m.id)).map(m => (
+                          <div key={m.id} onClick={() => addGuarantor(m)} className="p-3 hover:bg-emerald-50 cursor-pointer border-b border-gray-100">
+                            <p className="font-bold text-sm text-gray-800 font-bold">{m.name}</p>
+                            <p className="text-xs text-gray-400 font-semibold">{m.membership_no}</p>
+                          </div>
+                        ))}
                       </div>
                     )}
                   </div>
 
-                  {form.guarantor_ids.length === 0 ? (
-                    <p className="text-gray-400 text-sm text-center py-4">No guarantors added yet (minimum 2 required)</p>
-                  ) : (
-                    <div className="space-y-2">
-                      {form.guarantor_ids.map(id => {
-                        const m = getMember(id);
-                        return m ? (
-                          <div key={id} className="flex justify-between items-center p-3 bg-emerald-50 rounded-lg border border-emerald-200">
-                            <div>
-                              <p className="font-bold text-sm text-gray-800">{m.name}</p>
-                              <p className="text-xs text-gray-400">{m.membership_no} · <span className="capitalize">{m.role}</span></p>
-                            </div>
-                            <button onClick={() => removeGuarantor(id)} className="text-red-500 hover:text-red-700 text-xs font-bold">Remove</button>
+                  <div className="space-y-2">
+                    {form.guarantor_ids.map(id => {
+                      const m = getMember(id);
+                      return m ? (
+                        <div key={id} className="flex justify-between items-center p-3 bg-emerald-50 rounded-lg border border-emerald-200">
+                          <div>
+                            <p className="font-bold text-sm text-gray-800 font-bold">{m.name}</p>
+                            <p className="text-xs text-gray-400 font-semibold">{m.membership_no}</p>
                           </div>
-                        ) : null;
-                      })}
-                    </div>
-                  )}
+                          <button onClick={() => removeGuarantor(id)} className="text-red-500 hover:text-red-700 text-xs font-bold">Remove</button>
+                        </div>
+                      ) : null;
+                    })}
+                  </div>
                 </div>
 
                 <div className="flex gap-3">
@@ -749,51 +829,24 @@ export default function LoanDashboard() {
                     if (form.guarantor_ids.length < 2) return showToast("Minimum 2 guarantors required", "error");
                     setStep(4);
                   }} className="bg-gray-900 text-white font-black px-6 py-3 rounded-lg hover:bg-gray-800">
-                    Next: Review →
+                    Next: Final Review →
                   </button>
                 </div>
               </div>
             )}
 
-            {/* STEP 4: Review & Submit */}
             {step === 4 && (
               <div className="max-w-2xl">
-                <h2 className="text-xl font-black text-gray-800 mb-6">Final Review & Submit</h2>
+                <h2 className="text-xl font-black text-gray-800 mb-6 font-bold">Final Review & Submit</h2>
                 <div className="space-y-4">
                   <div className="bg-white border border-gray-200 rounded-xl p-5">
-                    <h4 className="font-black text-gray-600 text-xs uppercase tracking-widest mb-3">Loan Details</h4>
+                    <h4 className="font-black text-gray-600 text-xs uppercase tracking-widest mb-3">Application details</h4>
                     <div className="grid grid-cols-2 gap-3 text-sm">
-                      <div><p className="text-gray-400">Loan Type</p><p className="font-black text-gray-800">{selectedType?.name}</p></div>
-                      <div><p className="text-gray-400">Interest Rate</p><p className="font-black text-emerald-600">{selectedType?.interest_rate}% p.a.</p></div>
-                      <div><p className="text-gray-400">Principal</p><p className="font-black text-gray-800">KES {parseFloat(form.amount)?.toLocaleString()}</p></div>
-                      <div><p className="text-gray-400">Repayment Period</p><p className="font-black text-gray-800">{form.repayment_months} months</p></div>
-                      <div><p className="text-gray-400">Monthly Installment</p><p className="font-black text-emerald-600">KES {parseFloat(calc?.monthly)?.toLocaleString()}</p></div>
-                      <div><p className="text-gray-400">Total Payable</p><p className="font-black text-gray-800">KES {parseFloat(calc?.totalPayable)?.toLocaleString()}</p></div>
-                      <div className="col-span-2"><p className="text-gray-400">Purpose</p><p className="font-medium text-gray-800">{form.purpose}</p></div>
-                      {form.matatu_id && <div className="col-span-2"><p className="text-gray-400">Linked Matatu</p><p className="font-medium text-gray-800">{matatus.find(m => m.id == form.matatu_id)?.plate}</p></div>}
+                      <div><p className="text-gray-400 font-semibold font-semibold">Loan Type</p><p className="font-black text-gray-800">{selectedType?.name}</p></div>
+                      <div><p className="text-gray-400 font-semibold font-semibold">Intervals</p><p className="font-black text-gray-800">{form.repayment_months} ({selectedType?.repayment_frequency})</p></div>
+                      <div><p className="text-gray-400 font-semibold font-semibold">Total Payable</p><p className="font-black text-gray-800">KES {parseFloat(calc?.totalPayable)?.toLocaleString()}</p></div>
+                      <div><p className="text-gray-400 font-semibold font-semibold">Purpose</p><p className="font-medium text-gray-800">{form.purpose}</p></div>
                     </div>
-                  </div>
-
-                  <div className="bg-white border border-gray-200 rounded-xl p-5">
-                    <h4 className="font-black text-gray-600 text-xs uppercase tracking-widest mb-3">Guarantors ({form.guarantor_ids.length})</h4>
-                    <div className="space-y-2">
-                      {form.guarantor_ids.map(id => {
-                        const m = getMember(id);
-                        return m ? (
-                          <div key={id} className="flex items-center gap-3 p-2 bg-gray-50 rounded">
-                            <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center font-black text-emerald-700 text-sm">{m.name[0]}</div>
-                            <div><p className="font-bold text-sm text-gray-800">{m.name}</p><p className="text-xs text-gray-400">{m.membership_no}</p></div>
-                          </div>
-                        ) : null;
-                      })}
-                    </div>
-                  </div>
-
-                  <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
-                    <p className="text-amber-800 text-sm font-semibold">
-                      ⚠️ By submitting, you confirm all information is accurate and you have read and accepted the Terms & Conditions.
-                      Guarantors will be notified and must accept before admin review begins.
-                    </p>
                   </div>
                 </div>
 
@@ -809,144 +862,212 @@ export default function LoanDashboard() {
           </div>
         )}
 
-        {/* ═══════════════════════════════ DETAIL ══════════════════════════════ */}
+        {/* ═════════════════════════════ DETAILED VIEW ═══════════════════════ */}
         {view === "detail" && selectedLoan && (
           <div className="space-y-5">
-            {/* Status header */}
             <div className="bg-white border border-gray-200 rounded-xl p-5">
               <div className="flex justify-between items-start mb-4 flex-wrap gap-3">
                 <div>
-                  <p className="text-gray-400 text-sm">{selectedLoan.loan_type}</p>
+                  <p className="text-gray-400 text-sm font-semibold">{selectedLoan.loan_type}</p>
                   <p className="text-3xl font-black text-gray-900">KES {selectedLoan.amount?.toLocaleString()}</p>
-                  <p className="text-gray-500 text-sm mt-1">{selectedLoan.purpose}</p>
+                  <p className="text-gray-500 text-sm mt-1 font-semibold">{selectedLoan.purpose}</p>
                 </div>
                 <span className={`text-sm px-4 py-1.5 rounded-full font-bold border ${STATUS_CONFIG[selectedLoan.status]?.color}`}>
                   {STATUS_CONFIG[selectedLoan.status]?.icon} {STATUS_CONFIG[selectedLoan.status]?.label}
                 </span>
               </div>
 
-              {/* Rejection reason — prominent */}
-              {selectedLoan.status === "rejected" && selectedLoan.admin_notes && (
-                <div className="bg-red-50 border border-red-300 rounded-lg p-4 mb-4">
-                  <p className="text-red-700 font-black text-sm mb-1">❌ Loan Rejected</p>
-                  <p className="text-red-600 text-sm"><strong>Reason:</strong> {selectedLoan.admin_notes}</p>
-                </div>
-              )}
-
-              {/* Admin notes for other statuses */}
-              {selectedLoan.admin_notes && selectedLoan.status !== "rejected" && (
+              {selectedLoan.admin_notes && (
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
                   <p className="text-xs text-blue-600 font-bold uppercase mb-1">Admin Notes</p>
                   <p className="text-blue-800 text-sm">{selectedLoan.admin_notes}</p>
                 </div>
               )}
-
-              {/* Info-required: borrower response form */}
               {selectedLoan.status === "info_required" && (
-                <div className="bg-orange-50 border border-orange-300 rounded-lg p-4 mb-4">
-                  <p className="text-orange-700 font-black text-sm mb-1">ℹ️ More Information Requested</p>
-                  <p className="text-orange-600 text-xs mb-3">{selectedLoan.admin_notes}</p>
-                  <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Your Response</label>
-                  <textarea value={infoResponse} onChange={e => setInfoResponse(e.target.value)} rows={4}
-                    placeholder="Provide the requested information here..."
-                    className={`${textArea} mb-2`} />
-                  <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Attach Document (optional)</label>
-                  <input type="file" accept="image/*,.pdf"
-                    onChange={e => setInfoDoc(e.target.files[0])}
-                    className="w-full border border-gray-300 rounded-lg p-2 text-sm bg-white text-gray-700 file:mr-3 file:bg-orange-500 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold file:text-xs mb-3" />
-                  <button onClick={sendInfoResponse} disabled={sendingInfo}
-                    className="w-full bg-orange-500 text-white font-black py-2.5 rounded-lg hover:bg-orange-600 disabled:opacity-50">
-                    {sendingInfo ? "Sending..." : "📤 Submit Response for Re-Review"}
-                  </button>
+                <div className="bg-amber-50 border border-amber-300 rounded-xl p-5 mb-4">
+                  <h4 className="font-black text-amber-900 text-sm mb-1">ℹ️ Action Required: Upload Additional Information</h4>
+                  <p className="text-amber-800 text-xs mb-3 font-semibold">{selectedLoan.admin_notes || "Please upload the requested verification file below."}</p>
+                  
+                  <div className="space-y-3">
+                    <textarea
+                      value={infoResponse}
+                      onChange={e => setInfoResponse(e.target.value)}
+                      rows={2}
+                      placeholder="Type explanation / details here..."
+                      className="w-full border border-amber-300 rounded-lg p-2.5 text-xs bg-white text-gray-900 font-semibold"
+                    />
+                    <div>
+                      <label className="text-[11px] font-bold text-gray-700 block mb-1">Attach Supporting Document (PDF / Image)</label>
+                      <input
+                        type="file"
+                        accept="image/*,.pdf"
+                        onChange={e => setInfoDoc(e.target.files[0])}
+                        className="text-xs text-gray-600 file:bg-amber-600 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold"
+                      />
+                    </div>
+                    <button
+                      onClick={sendInfoResponse}
+                      disabled={sendingInfo}
+                      className="bg-amber-600 text-white font-black px-4 py-2 rounded-lg text-xs hover:bg-amber-700"
+                    >
+                      {sendingInfo ? "Uploading..." : "📨 Submit Response & Document"}
+                    </button>
+                  </div>
                 </div>
               )}
 
-              {/* Loan financials */}
+              {/* Penalty Clearance Box */}
+              {selectedLoan.penalty > 0 && (
+                <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex justify-between items-center mb-4">
+                  <div>
+                    <p className="font-black text-red-800 text-sm">⚠️ Penalty Fee: KES {selectedLoan.penalty.toLocaleString()}</p>
+                    <p className="text-red-600 text-xs font-semibold">
+                      {selectedLoan.penalty_status === "pending_approval"
+                        ? "⏳ Penalty payment submitted. Awaiting approval from HR/Admin."
+                        : "Standard installment repayments are blocked until this penalty is cleared."}
+                    </p>
+                  </div>
+                  {selectedLoan.penalty_status !== "pending_approval" && (
+                    <button
+                      onClick={async () => {
+                        const amt = prompt("Enter amount to clear towards penalty:", selectedLoan.penalty);
+                        if (!amt || isNaN(amt)) return;
+                        const res = await authPost(`/loan-applications/${selectedLoan.id}/pay-penalty`, { amount: parseFloat(amt) });
+                        if (res.ok) {
+                          showToast("Penalty payment submitted for approval ✓");
+                          fetchAll();
+                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
+                          if (updated) setSelectedLoan(updated);
+                        }
+                      }}
+                      className="bg-red-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg hover:bg-red-700"
+                    >
+                      Clear Penalty
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* High Contrast Rate Revision Borrower Commitment Notice */}
+              {selectedLoan.rate_change_pending && (
+                <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-5 mb-5 shadow-sm">
+                  <h4 className="font-black text-blue-900 text-base mb-2 flex items-center gap-2">📢 Policy Rate Modification Notice</h4>
+                  <p className="text-blue-900 text-sm mb-4 leading-relaxed font-semibold bg-white/60 p-3 rounded-lg border border-blue-100">
+                    {selectedLoan.rate_change_notes}
+                  </p>
+                  <div className="flex gap-3">
+                    <button
+                      onClick={async () => {
+                        const res = await authPut(`/loan-applications/${selectedLoan.id}/commitment`, { status: "agreed" });
+                        if (res.ok) {
+                          showToast("Commitment agreement sent to HR/Admin ✓");
+                          fetchAll();
+                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
+                          if (updated) setSelectedLoan(updated);
+                        } else {
+                          showToast("Failed to agree", "error");
+                        }
+                      }}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold px-4 py-2 rounded-lg flex items-center gap-1.5 transition-colors shadow-sm"
+                    >
+                      ✅ Agree & Accept New Terms
+                    </button>
+                    <button
+                      onClick={async () => {
+                        const reason = prompt("State your reason for declining this rate change:");
+                        if (reason === null) return;
+                        const res = await authPut(`/loan-applications/${selectedLoan.id}/commitment`, { status: "disagreed", reason });
+                        if (res.ok) {
+                          showToast("Notice sent back to HR/Admin ✓");
+                          fetchAll();
+                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
+                          if (updated) setSelectedLoan(updated);
+                        } else {
+                          showToast("Failed to decline", "error");
+                        }
+                      }}
+                      className="bg-red-50 hover:bg-red-100 border border-red-200 text-red-700 text-sm font-bold px-4 py-2 rounded-lg transition-colors"
+                    >
+                      ❌ Disagree & Request Review
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Installment parameters */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                 {[
                   ["Interest Rate", `${selectedLoan.interest_rate}% p.a.`],
-                  ["Monthly Payment", `KES ${selectedLoan.monthly_installment?.toLocaleString()}`],
+                  ["Scheduled Payment", `KES ${selectedLoan.monthly_installment?.toLocaleString()}`],
                   ["Total Payable", `KES ${selectedLoan.total_payable?.toLocaleString()}`],
-                  ["Repayment Period", `${selectedLoan.repayment_months} months`],
+                  ["Schedule Terms", `${selectedLoan.repayment_months} periods`],
                 ].map(([l,v],i) => (
                   <div key={i} className="bg-gray-50 rounded-lg p-3">
-                    <p className="text-gray-400 text-xs">{l}</p>
+                    <p className="text-gray-400 text-xs font-bold">{l}</p>
                     <p className="font-black text-gray-800 mt-0.5">{v}</p>
                   </div>
                 ))}
               </div>
 
-              {/* Repayment progress */}
+              {/* Repay progress */}
               {["repaying","cleared","disbursed","approved"].includes(selectedLoan.status) && (
                 <div className="mt-4">
                   <div className="flex justify-between text-xs text-gray-400 mb-1">
                     <span>Repaid: KES {selectedLoan.amount_repaid?.toLocaleString()}</span>
-                    <span>Balance: KES {(selectedLoan.total_payable-selectedLoan.amount_repaid)?.toLocaleString()}</span>
+                    <span>Remaining Balance: KES {(selectedLoan.total_payable-selectedLoan.amount_repaid)?.toLocaleString()}</span>
                   </div>
                   <div className="w-full bg-gray-100 rounded-full h-3">
                     <div className="h-3 rounded-full bg-emerald-500 transition-all"
                       style={{ width:`${Math.min((selectedLoan.amount_repaid/selectedLoan.total_payable)*100,100)}%` }} />
                   </div>
-                  {selectedLoan.penalty > 0 && (
-                    <p className="text-xs text-red-600 mt-1 font-semibold">⚠️ Penalty: KES {selectedLoan.penalty?.toLocaleString()}</p>
-                  )}
                 </div>
               )}
 
               {["approved","disbursed","repaying"].includes(selectedLoan.status) && (
                 <div className="flex gap-2 mt-4 flex-wrap">
-                  <button onClick={() => setShowPayModal(true)}
-                    className="bg-emerald-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-emerald-700">
-                    💳 Make Repayment
-                  </button>
+                  {selectedLoan.penalty > 0 && selectedLoan.penalty_status !== "pending_approval" ? (
+                    <div className="w-full bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-xs font-bold leading-relaxed">
+                      ⚠️ Regular repayments are blocked because you have an outstanding penalty of <strong>KES {selectedLoan.penalty?.toLocaleString()}</strong>. Use the <strong>"Clear Penalty"</strong> option below first. Regular payments will resume once approved.
+                    </div>
+                  ) : (
+                    <button onClick={() => setShowPayModal(true)}
+                      className="bg-emerald-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-emerald-700">
+                      💳 Record Payment
+                    </button>
+                  )}
                   <button onClick={() => setShowRepaymentAccount(true)}
                     className="bg-blue-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-blue-700">
-                    🏦 Repayment Account
+                    🏦 Repayment Account & Logs
                   </button>
                 </div>
               )}
             </div>
 
-            {/* DISBURSEMENT PROOF — visible to borrower */}
-            {selectedLoan.disburse_proof && (
-              <div className="bg-white border border-gray-200 rounded-xl p-5">
-                <h3 className="font-black text-gray-700 mb-3">💸 Disbursement Confirmation</h3>
-                <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                  <p className="text-green-700 font-bold text-sm mb-1">✅ Loan Disbursed</p>
-                  {selectedLoan.disburse_note && (
-                    <p className="text-green-600 text-sm mb-3">{selectedLoan.disburse_note}</p>
-                  )}
-                  <a href={selectedLoan.disburse_proof} target="_blank" rel="noreferrer"
-                    className="inline-flex items-center gap-2 bg-green-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-green-700">
-                    📎 View Disbursement Proof
-                  </a>
-                </div>
-              </div>
-            )}
-
-            {/* Repayment schedule */}
+            {/* Repayment schedule displaying dynamic dates */}
             {selectedLoan.schedule?.length > 0 && (
               <div className="bg-white border border-gray-200 rounded-xl p-5">
-                <h3 className="font-black text-gray-700 mb-3">Repayment Schedule</h3>
+                <h3 className="font-black text-gray-700 mb-3">Installment Repayment Schedule</h3>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
-                    <thead><tr className="border-b border-gray-100">
-                      {["#","Due Date","Amount Due","Paid","Status"].map(h => (
-                        <th key={h} className="text-left p-2 text-gray-400 font-semibold text-xs">{h}</th>
-                      ))}
-                    </tr></thead>
+                    <thead>
+                      <tr className="border-b border-gray-100">
+                        {["No.","Due Date","Amount Due","Paid","Status"].map(h => (
+                          <th key={h} className="text-left p-2 text-gray-400 font-semibold text-xs">{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
                     <tbody>
                       {selectedLoan.schedule.map(s => (
-                        <tr key={s.id} className="border-b border-gray-50 hover:bg-gray-50">
-                          <td className="p-2 text-gray-400">{s.installment_no}</td>
-                          <td className="p-2 font-medium text-gray-800">{s.due_date}</td>
-                          <td className="p-2 font-bold text-gray-800">KES {s.amount_due?.toLocaleString()}</td>
-                          <td className="p-2 text-emerald-600 font-bold">KES {s.amount_paid?.toLocaleString()}</td>
+                        <tr key={s.id} className="border-b border-gray-50 hover:bg-gray-50 font-bold">
+                          <td className="p-2 text-gray-400">#{s.installment_no}</td>
+                          <td className="p-2 text-gray-855">{s.due_date}</td>
+                          <td className="p-2 text-gray-855">KES {s.amount_due?.toLocaleString()}</td>
+                          <td className="p-2 text-emerald-600">KES {s.amount_paid?.toLocaleString()}</td>
                           <td className="p-2">
-                            <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${
-                              s.status === "paid"   ? "bg-green-100 text-green-700" :
-                              s.status === "overdue"? "bg-red-100 text-red-700" :
-                              "bg-gray-100 text-gray-600"
+                            <span className={`text-xs px-2.5 py-0.5 rounded-full font-bold ${
+                              s.status === "paid"   ? "bg-green-100 text-green-700 border border-green-250" :
+                              s.status === "overdue"? "bg-red-100 text-red-700 border border-red-250" :
+                              "bg-gray-100 text-gray-650"
                             }`}>{s.status}</span>
                           </td>
                         </tr>
@@ -956,180 +1077,375 @@ export default function LoanDashboard() {
                 </div>
               </div>
             )}
-
-            {/* Payment history */}
-            <div className="bg-white border border-gray-200 rounded-xl p-5">
-              <h3 className="font-black text-gray-700 mb-3">Payment History</h3>
-              {loanPayments.length === 0 ? (
-                <p className="text-gray-400 text-sm text-center py-4">No payments made yet</p>
-              ) : (
-                <div className="space-y-2">
-                  {loanPayments.map(p => (
-                    <div key={p.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg border border-gray-100">
-                      <div>
-                        <p className="font-black text-emerald-600">KES {p.amount?.toLocaleString()}</p>
-                        <p className="text-xs text-gray-400">{p.date} · {p.payment_method}{p.mpesa_code && ` · ${p.mpesa_code}`}</p>
-                      </div>
-                      {p.proof_file && (
-                        <a href={p.proof_file} target="_blank" rel="noreferrer"
-                          className="text-xs bg-white border border-gray-200 text-gray-600 px-3 py-1 rounded hover:bg-gray-100">
-                          📎 Proof
-                        </a>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* Guarantors */}
-            {selectedLoan.guarantors?.length > 0 && (
-              <div className="bg-white border border-gray-200 rounded-xl p-5">
-                <h3 className="font-black text-gray-700 mb-3">Guarantors</h3>
-                <div className="space-y-2">
-                  {selectedLoan.guarantors.map(g => {
-                    const m = getMember(g.guarantor_id);
-                    return (
-                      <div key={g.id} className="flex justify-between items-center p-3 bg-gray-50 rounded-lg">
-                        <div>
-                          <p className="font-bold text-sm text-gray-800">{m?.name || `Member #${g.guarantor_id}`}</p>
-                          <p className="text-xs text-gray-400">{m?.membership_no}</p>
-                        </div>
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${
-                          g.status==="accepted"?"bg-green-100 text-green-700":
-                          g.status==="rejected"?"bg-red-100 text-red-700":
-                          "bg-yellow-100 text-yellow-700"
-                        }`}>{g.status}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Supporting doc */}
-            {selectedLoan.supporting_doc && (
-              <div className="bg-white border border-gray-200 rounded-xl p-5">
-                <h3 className="font-black text-gray-700 mb-3">Supporting Document</h3>
-                <a href={selectedLoan.supporting_doc} target="_blank" rel="noreferrer"
-                  className="inline-flex items-center gap-2 bg-blue-50 border border-blue-200 text-blue-700 font-bold px-4 py-2 rounded-lg hover:bg-blue-100">
-                  📎 View Document
-                </a>
-              </div>
-            )}
           </div>
         )}
 
-        {/* ═══════════════════════════════ GUARANTORS ══════════════════════════ */}
+        {/* ════════════════ GUARANTOR FLOWS ════════════════ */}
         {view === "guarantors" && (
           <div className="space-y-4">
+            <h3 className="font-black text-gray-800 text-lg mb-2">Pending Requests</h3>
             {guarantorRequests.length === 0 ? (
               <div className="bg-white border border-gray-200 rounded-xl p-8 text-center text-gray-400">
-                <p className="text-4xl mb-2">🤝</p><p>No pending guarantor requests</p>
+                <p className="text-4xl mb-3">🤝</p>
+                <p>No pending guarantor requests</p>
               </div>
-            ) : guarantorRequests.map(g => (
-              <div key={g.id} className="bg-white border border-gray-200 rounded-xl p-5">
-                <div className="flex justify-between items-start mb-3">
-                  <div>
-                    <h3 className="font-black text-gray-800">{g.member_name} is requesting you as a guarantor</h3>
-                    <p className="text-gray-400 text-sm">{g.membership_no}</p>
+            ) : (
+              guarantorRequests.map(g => (
+                <div key={g.id} className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+                  <div className="flex justify-between items-start">
+                    <div>
+                      <h4 className="font-black text-gray-800 text-base">{g.member_name}</h4>
+                      <p className="text-xs text-gray-400 font-mono">{g.membership_no}</p>
+                      <p className="text-sm text-gray-600 mt-2">
+                        Has asked you to guarantee a loan of <strong className="text-gray-900">KES {g.loan_amount?.toLocaleString()}</strong>.
+                      </p>
+                    </div>
+                    <span className="text-xs text-gray-400">{new Date(g.created_at).toLocaleDateString()}</span>
                   </div>
-                  <span className="text-xs text-gray-400">{new Date(g.created_at).toLocaleDateString()}</span>
-                </div>
-                <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm">
-                  <div className="grid grid-cols-2 gap-2">
-                    <div><span className="text-gray-400">Loan Amount: </span><span className="font-black text-gray-800">KES {g.loan_amount?.toLocaleString()}</span></div>
-                    <div className="col-span-2"><span className="text-gray-400">Purpose: </span><span className="font-medium text-gray-800">{g.loan_purpose}</span></div>
+                  <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 text-xs text-gray-700">
+                    <strong>Purpose:</strong> {g.loan_purpose}
+                  </div>
+                  <div className="flex gap-2 pt-2">
+                    <button
+                      onClick={() => respondToGuarantor(g.id, "accepted")}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-4 py-2 rounded-lg text-xs"
+                    >
+                      ✅ Guarantee / Accept Request
+                    </button>
+                    <button
+                      onClick={() => respondToGuarantor(g.id, "rejected")}
+                      className="bg-red-600 hover:bg-red-750 text-white font-bold px-4 py-2 rounded-lg text-xs"
+                    >
+                      ❌ Reject / Decline Request
+                    </button>
                   </div>
                 </div>
-                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4">
-                  <p className="text-amber-800 text-xs font-semibold">⚠️ As a guarantor you are liable if this member defaults on this loan.</p>
-                </div>
-                <div className="flex gap-3">
-                  <button onClick={() => respondToGuarantor(g.id, "accepted")}
-                    className="flex-1 bg-emerald-600 text-white font-black py-2.5 rounded-lg hover:bg-emerald-700">✅ Accept</button>
-                  <button onClick={() => respondToGuarantor(g.id, "rejected")}
-                    className="flex-1 bg-red-100 text-red-700 font-black py-2.5 rounded-lg hover:bg-red-200">❌ Reject</button>
-                </div>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         )}
 
-        {/* ═══════════════════════════ GUARANTOR HISTORY ═══════════════════════ */}
         {view === "guarantorHistory" && (
           <div className="space-y-4">
-            <p className="text-gray-500 text-sm">All guarantor requests you have received — permanently visible regardless of status.</p>
+            <h3 className="font-black text-gray-800 text-lg mb-2">Guarantorship History</h3>
             {guarantorHistory.length === 0 ? (
               <div className="bg-white border border-gray-200 rounded-xl p-8 text-center text-gray-400">
-                <p className="text-4xl mb-2">🤝</p><p>No guarantor history yet</p>
+                <p className="text-4xl mb-3">🤝</p>
+                <p>No historical requests recorded on your profile</p>
               </div>
-            ) : guarantorHistory.map(g => (
-              <div key={g.id} className={`bg-white border rounded-xl p-5 ${
-                g.status==="accepted"?"border-green-300":g.status==="rejected"?"border-red-200":"border-yellow-300"
-              }`}>
-                <div className="flex justify-between items-start mb-3 flex-wrap gap-2">
-                  <div>
-                    <p className="font-black text-gray-800">{g.member_name}</p>
-                    <p className="text-xs text-gray-400">{g.membership_no} · {g.loan_type}</p>
-                  </div>
-                  <div className="flex gap-2 items-center">
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${(GUARANTEE_STATUS[g.status]||{}).color}`}>
-                      {(GUARANTEE_STATUS[g.status]||{}).icon} {g.status}
-                    </span>
-                    <span className={`text-xs px-2 py-0.5 rounded-full font-bold ${STATUS_CONFIG[g.loan_status]?.color||"bg-gray-100 text-gray-600"}`}>
-                      Loan: {g.loan_status?.replace(/_/g," ")}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 text-sm mb-3">
-                  <div className="bg-gray-50 rounded-lg p-3">
-                    <p className="text-xs text-gray-400">Loan Amount</p>
-                    <p className="font-black text-gray-800">KES {g.loan_amount?.toLocaleString()}</p>
-                  </div>
-                  <div className="bg-gray-50 rounded-lg p-3">
-                    <p className="text-xs text-gray-400">Purpose</p>
-                    <p className="font-medium text-gray-700 text-xs truncate">{g.loan_purpose}</p>
-                  </div>
-                </div>
-
-                {g.status === "accepted" && (
-                  <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-xs">
-                    <p className="text-green-700 font-black mb-1">✅ You are an active guarantor for this loan</p>
-                    <div className="flex gap-4 text-gray-600">
-                      <span>Repaid: <span className="font-bold text-green-600">KES {g.amount_repaid?.toLocaleString()}</span></span>
-                      <span>Outstanding: <span className="font-bold text-red-600">KES {((g.total_payable||0)-(g.amount_repaid||0)).toLocaleString()}</span></span>
+            ) : (
+              guarantorHistory.map(g => {
+                const cfg = GUARANTEE_STATUS[g.status] || { color: "bg-gray-100 text-gray-700 border-gray-200", icon: "⏳" };
+                return (
+                  <div key={g.id} className={`bg-white border rounded-xl p-5 ${g.status === "accepted" ? "border-green-300" : g.status === "rejected" ? "border-red-200" : "border-amber-300"}`}>
+                    <div className="flex justify-between items-start mb-3">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <p className="font-black text-gray-800 text-lg">{g.member_name}</p>
+                          <span className="text-xs text-gray-400">{g.membership_no}</span>
+                        </div>
+                        <p className="text-gray-500 text-sm capitalize">{g.loan_type} Loan</p>
+                      </div>
+                      <span className={`text-xs px-3 py-1 rounded-full font-bold border ${cfg.color}`}>
+                        {cfg.icon} {cfg.label || g.status}
+                      </span>
                     </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-3 text-sm mb-3">
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <p className="text-gray-400 text-xs">Loan Amount</p>
+                        <p className="font-black">KES {g.loan_amount?.toLocaleString()}</p>
+                      </div>
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <p className="text-gray-400 text-xs">Loan Status</p>
+                        <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-gray-100 text-gray-700 capitalize">
+                          {g.loan_status?.replace(/_/g," ")}
+                        </span>
+                      </div>
+                      <div className="bg-gray-50 rounded-lg p-3">
+                        <p className="text-gray-400 text-xs">Loan Type</p>
+                        <p className="font-bold text-gray-700">{g.loan_type || "—"}</p>
+                      </div>
+                    </div>
+
+                    <p className="text-gray-500 text-sm mb-2">Purpose: {g.loan_purpose}</p>
+
+                    {g.status === "accepted" && (
+                      <div className="bg-green-50 border border-green-200 rounded-xl p-4 mt-2">
+                        <p className="font-black text-green-800 text-sm mb-2">✅ You are an active guarantor for this loan</p>
+                        <div className="flex gap-4 text-sm mb-3">
+                          <div>
+                            <p className="text-gray-400 text-xs">Amount Repaid</p>
+                            <p className="font-black text-green-700">KES {g.amount_repaid?.toLocaleString()}</p>
+                          </div>
+                          <div>
+                            <p className="text-gray-400 text-xs">Outstanding</p>
+                            <p className="font-black text-red-650">KES {((g.total_payable||0)-(g.amount_repaid||0)).toLocaleString()}</p>
+                          </div>
+                          <div>
+                            <p className="text-gray-400 text-xs">Total Payable</p>
+                            <p className="font-black text-gray-700 font-bold">KES {g.total_payable?.toLocaleString()}</p>
+                          </div>
+                        </div>
+                        {g.total_payable > 0 && (
+                          <div>
+                            <div className="flex justify-between text-xs text-gray-400 mb-1">
+                              <span>{Math.round((g.amount_repaid/g.total_payable)*100)}% repaid</span>
+                            </div>
+                            <div className="w-full bg-gray-200 rounded-full h-2">
+                              <div className="h-2 rounded-full bg-green-500" style={{width:`${Math.min((g.amount_repaid/g.total_payable)*100,100)}%`}} />
+                            </div>
+                          </div>
+                        )}
+                        {g.loan_status === "defaulted" && (
+                          <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-2">
+                            <p className="text-red-700 text-xs font-bold animate-pulse">⚠️ This loan is in default. As guarantor you may be liable.</p>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    <p className="text-gray-400 text-xs mt-3">
+                      Requested: {new Date(g.created_at).toLocaleDateString()}
+                      {g.responded_at && ` · Responded: ${new Date(g.responded_at).toLocaleDateString()}`}
+                    </p>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {/* ════════════════ ADMIN: MANAGE CONFIG LOAN TYPES ════════════════ */}
+        {view === "adminLoanTypes" && (
+          <div className="space-y-6">
+            <div className="flex justify-between items-center bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+              <div>
+                <h2 className="text-xl font-black text-gray-900 font-bold">⚙️ Advanced Loan Types Configuration</h2>
+                <p className="text-gray-500 text-sm font-semibold">Define custom repayment cycles, start rules, T&C document references, and penalty matrices.</p>
+              </div>
+              <button onClick={() => { setSelectedType(null); setView("dashboard"); }}
+                className="bg-gray-100 text-gray-700 font-bold px-4 py-2 rounded-lg text-sm hover:bg-gray-200">
+                ← Exit Rules Portal
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+              {/* Existing Types list */}
+              <div className="space-y-3 bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
+                <h3 className="font-black text-gray-800 text-sm mb-2 uppercase tracking-wider">Configured Types</h3>
+                {loanTypes.map(lt => (
+                  <div key={lt.id} className="p-4 rounded-xl border border-gray-155 bg-gray-50 hover:border-emerald-500 transition-all">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <h4 className="font-black text-gray-800 text-sm">{lt.name}</h4>
+                        <p className="text-xs text-gray-400 font-semibold">{lt.min_amount?.toLocaleString()} - {lt.max_amount?.toLocaleString()} KES</p>
+                        <p className="text-[11px] text-emerald-600 font-bold mt-1 uppercase">Cycle: {lt.repayment_frequency || "monthly"}</p>
+                      </div>
+                      <button onClick={() => {
+                        setSelectedType(lt);
+                        setForm({
+                          ...form,
+                          name: lt.name,
+                          interest_rate: lt.interest_rate,
+                          min_amount: lt.min_amount,
+                          max_amount: lt.max_amount,
+                          min_months: lt.min_months,
+                          max_months: lt.max_months,
+                          description: lt.description,
+                          repayment_frequency: lt.repayment_frequency || "monthly",
+                          repayment_start_rule: lt.repayment_start_rule || "next_period",
+                          penalty_type: lt.penalty_type || "percentage",
+                          penalty_amount: lt.penalty_amount || 5.0,
+                          penalty_frequency: lt.penalty_frequency || "monthly",
+                          grace_period_days: lt.grace_period_days || 3,
+                        });
+                      }} className="text-xs bg-emerald-600 text-white px-2.5 py-1 rounded font-bold hover:bg-emerald-700">
+                        Edit Rule
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                <button onClick={() => {
+                  setSelectedType(null);
+                  setForm({
+                    name: "", interest_rate: "", max_amount: "", min_amount: "", max_months: "", min_months: "", description: "",
+                    repayment_frequency: "monthly", repayment_start_rule: "next_period", penalty_type: "percentage", penalty_amount: 5, penalty_frequency: "monthly", grace_period_days: 3
+                  });
+                }} className="w-full bg-slate-900 text-white font-black py-2.5 rounded-lg text-sm hover:bg-slate-800">
+                  + Configure New Type
+                </button>
+              </div>
+
+              {/* Form container */}
+              <div className="lg:col-span-2 bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+                <h3 className="font-black text-gray-800 text-sm border-b border-gray-100 pb-2">
+                  {selectedType ? `Modify ${selectedType.name} Specifications` : "Configure a New Loan Type"}
+                </h3>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Loan Name</label>
+                    <input type="text" placeholder="e.g. Weekly Matatu Loan" value={form.name || ""}
+                      onChange={e => setForm({ ...form, name: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Interest Rate (% p.a.)</label>
+                    <input type="number" placeholder="e.g. 10" value={form.interest_rate || ""}
+                      onChange={e => setForm({ ...form, interest_rate: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Min Borrowing Limit (KES)</label>
+                    <input type="number" placeholder="e.g. 1000" value={form.min_amount || ""}
+                      onChange={e => setForm({ ...form, min_amount: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Max Borrowing Limit (KES)</label>
+                    <input type="number" placeholder="e.g. 150000" value={form.max_amount || ""}
+                      onChange={e => setForm({ ...form, max_amount: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Min Installment Cycles</label>
+                    <input type="number" placeholder="e.g. 4" value={form.min_months || ""}
+                      onChange={e => setForm({ ...form, min_months: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Max Installment Cycles</label>
+                    <input type="number" placeholder="e.g. 52" value={form.max_months || ""}
+                      onChange={e => setForm({ ...form, max_months: e.target.value })} className={inp} />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 border-t border-gray-100 pt-3">
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Repayment Frequency</label>
+                    <select value={form.repayment_frequency || "monthly"}
+                      onChange={e => setForm({ ...form, repayment_frequency: e.target.value })} className={inp}>
+                      <option value="daily">Daily Repayments</option>
+                      <option value="weekly">Weekly Repayments</option>
+                      <option value="monthly">Monthly Repayments</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">First Payment Due Date</label>
+                    <select value={form.repayment_start_rule || "next_period"}
+                      onChange={e => setForm({ ...form, repayment_start_rule: e.target.value })} className={inp}>
+                      <option value="same_day">Same day since borrowed ("loan approved")</option>
+                      <option value="next_period">Standard next period (e.g. next month/week/day)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4 border-t border-gray-100 pt-3">
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Penalty Calculation</label>
+                    <select value={form.penalty_type || "percentage"}
+                      onChange={e => setForm({ ...form, penalty_type: e.target.value })} className={inp}>
+                      <option value="percentage">Percentage on overdue installment</option>
+                      <option value="fixed">Fixed cash penalty fee</option>
+                      <option value="disciplinary">Account Suspension warning</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Overdue Penalty Rate / Amount</label>
+                    <input type="number" placeholder="e.g. 5" value={form.penalty_amount || ""}
+                      onChange={e => setForm({ ...form, penalty_amount: e.target.value })} className={inp} />
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Overdue Accumulation Period</label>
+                    <select value={form.penalty_frequency || "monthly"}
+                      onChange={e => setForm({ ...form, penalty_frequency: e.target.value })} className={inp}>
+                      <option value="daily">Accrues Daily</option>
+                      <option value="weekly">Accrues Weekly</option>
+                      <option value="monthly">Accrues Monthly</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Grace Period (Days)</label>
+                    <input type="number" placeholder="e.g. 3" value={form.grace_period_days || ""}
+                      onChange={e => setForm({ ...form, grace_period_days: e.target.value })} className={inp} />
+                  </div>
+                </div>
+
+                <div className="border-t border-gray-100 pt-3">
+                  <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Description</label>
+                  <textarea placeholder="Write a short description..." value={form.description || ""}
+                    onChange={e => setForm({ ...form, description: e.target.value })} rows={2} className={`${inp} resize-none`} />
+                </div>
+
+                {/* Terms document uploader */}
+                {selectedType && (
+                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 space-y-2">
+                    <p className="text-xs text-blue-700 font-bold uppercase tracking-wide">📄 Upload / Update Terms & Conditions (PDF / Image)</p>
+                    <p className="text-[11px] text-blue-600 font-bold">Borrowers must read and accept this before applying. You can update it anytime.</p>
+                    <input type="file" accept="image/*,.pdf"
+                      onChange={e => handleFileUpload(selectedType.id, e.target.files[0])}
+                      className="w-full border border-blue-300 rounded-lg p-2 text-xs bg-white text-gray-700 file:mr-3 file:bg-blue-600 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold file:text-xs" />
+                    {selectedType.terms_file && (
+                      <a href={selectedType.terms_file} target="_blank" rel="noreferrer" className="text-xs text-blue-600 font-bold underline block">
+                        View current document →
+                      </a>
+                    )}
                   </div>
                 )}
 
-                <p className="text-xs text-gray-400 mt-2">
-                  Requested: {new Date(g.created_at).toLocaleDateString()}
-                  {g.responded_at && ` · Responded: ${new Date(g.responded_at).toLocaleDateString()}`}
-                </p>
+                <div className="flex gap-3 justify-end pt-3">
+                  <button onClick={async () => {
+                    setLoading(true);
+                    const payload = {
+                      name: form.name,
+                      interest_rate: parseFloat(form.interest_rate),
+                      min_amount: parseFloat(form.min_amount),
+                      max_amount: parseFloat(form.max_amount),
+                      min_months: parseInt(form.min_months),
+                      max_months: parseInt(form.max_months),
+                      description: form.description,
+                      repayment_frequency: form.repayment_frequency,
+                      repayment_start_rule: form.repayment_start_rule,
+                      penalty_type: form.penalty_type,
+                      penalty_amount: parseFloat(form.penalty_amount),
+                      penalty_frequency: form.penalty_frequency,
+                      grace_period_days: parseInt(form.grace_period_days)
+                    };
+
+                    const url = selectedType ? `${API}/loan-types/${selectedType.id}` : `${API}/loan-types`;
+                    const method = selectedType ? "PUT" : "POST";
+
+                    const res = await fetch(url, {
+                      method, headers: hdr(), body: JSON.stringify(payload)
+                    });
+                    setLoading(false);
+                    if (res.ok) {
+                      showToast(selectedType ? "Specifications updated successfully ✓" : "New configuration saved successfully ✓");
+                      setSelectedType(null);
+                      setView("dashboard");
+                      fetchAll();
+                    } else {
+                      showToast("Configuration save failed", "error");
+                    }
+                  }} className="bg-emerald-600 text-white font-black px-6 py-3 rounded-lg text-sm hover:bg-emerald-700">
+                    {selectedType ? "Save Changes" : "Save Configuration"}
+                  </button>
+                </div>
               </div>
-            ))}
+            </div>
           </div>
         )}
+
       </div>
 
-      {/* ══════════════════════ PAYMENT MODAL ══════════════════════ */}
+      {/* Payment prompt Modal */}
       {showPayModal && selectedLoan && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
             <div className="flex justify-between items-center mb-4">
-              <h3 className="font-black text-gray-900">Make Repayment</h3>
+              <h3 className="font-black text-gray-900 font-bold">Record Payment</h3>
               <button onClick={() => setShowPayModal(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
             </div>
             <div className="bg-gray-50 rounded-xl p-4 mb-4">
               <div className="flex justify-between text-sm">
-                <span className="text-gray-400">Outstanding Balance</span>
-                <span className="font-black text-red-600">KES {(selectedLoan.total_payable-selectedLoan.amount_repaid)?.toLocaleString()}</span>
-              </div>
-              <div className="flex justify-between text-sm mt-1">
-                <span className="text-gray-400">Monthly Installment</span>
-                <span className="font-black text-emerald-600">KES {selectedLoan.monthly_installment?.toLocaleString()}</span>
+                <span className="text-gray-400 font-bold">Outstanding Balance</span>
+                <span className="font-black text-red-600 font-bold">KES {(selectedLoan.total_payable-selectedLoan.amount_repaid)?.toLocaleString()}</span>
               </div>
             </div>
             <div className="space-y-3 mb-4">
@@ -1149,34 +1465,21 @@ export default function LoanDashboard() {
               {payForm.payment_method === "mpesa" && (
                 <div>
                   <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">M-Pesa Code</label>
-                  <input placeholder="e.g. QHJ7KL..." value={payForm.mpesa_code}
+                  <input placeholder="Ref Code" value={payForm.mpesa_code}
                     onChange={e => setPayForm({...payForm,mpesa_code:e.target.value})} className={inp} />
                 </div>
               )}
-              <div>
-                <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Date</label>
-                <input type="date" value={payForm.date} onChange={e => setPayForm({...payForm,date:e.target.value})} className={inp} />
-              </div>
-              <div>
-                <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Proof of Payment (optional)</label>
-                <input type="file" accept="image/*,.pdf"
-                  onChange={e => setPayForm({...payForm,proof_file:e.target.files[0]})}
-                  className="w-full border border-gray-300 rounded-lg p-3 text-sm bg-white text-gray-700 file:mr-3 file:bg-emerald-600 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold file:text-xs" />
-              </div>
             </div>
             <div className="flex gap-3">
               <button onClick={makePayment} disabled={loading}
                 className="flex-1 bg-emerald-600 text-white font-black py-3 rounded-lg hover:bg-emerald-700 disabled:opacity-50">
-                {loading ? "Processing..." : "✅ Confirm Payment"}
+                {loading ? "Processing..." : "Confirm Payment"}
               </button>
-              <button onClick={() => setShowPayModal(false)}
-                className="flex-1 bg-gray-100 text-gray-700 font-bold py-3 rounded-lg hover:bg-gray-200">Cancel</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Repayment account modal */}
       {showRepaymentAccount && selectedLoan && (
         <RepaymentAccount loan={selectedLoan} onClose={() => setShowRepaymentAccount(false)} />
       )}

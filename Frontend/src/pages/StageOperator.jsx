@@ -1,22 +1,19 @@
 import { useState, useEffect } from "react";
 import API from "../api";
 import { useAuth } from "../context/AuthContext";
-import LoanDashboard from "../components/LoanDashboard";
-
-
+import { useNavigate } from "react-router-dom";
+import StageExpensesAndWelfare from "../components/StageExpensesAndWelfare";
 
 const TABS = [
   { key: "issue",            label: "🎫 Issue Receipt" },
   { key: "receipts",         label: "📋 My Receipts" },
-  { key: "savings",          label: "🏦 Savings" },
-  { key: "loans",            label: "💼 Loans" },
-  { key: "guarantorHistory", label: "🤝 Guarantor History" },
+  { key: "stageOperations",  label: "🛡️ Stage & Expenses" }, 
 ];
 
 function Toast({ msg, type, onClose }) {
-  useEffect(() => { const t = setTimeout(onClose, 3000); return () => clearTimeout(t); }, [onClose]);
+  useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
   return (
-    <div className={`fixed top-5 right-5 z-50 px-5 py-3 rounded-lg shadow-2xl text-sm font-bold
+    <div className={`fixed top-5 right-5 z-50 px-5 py-3 rounded-lg shadow-2xl text-sm font-bold animate-bounce
       ${type === "error" ? "bg-red-500 text-white" : "bg-blue-600 text-white"}`}>
       {msg}
     </div>
@@ -24,13 +21,21 @@ function Toast({ msg, type, onClose }) {
 }
 
 export default function StageOperator() {
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState("issue");
   const [toast, setToast]         = useState(null);
   const showToast = (msg, type = "success") => setToast({ msg, type });
-
+  const navigate = useNavigate(); 
   const token   = localStorage.getItem("token");
   const headers = { Authorization: `Bearer ${token}` };
+
+  // ── Receipt settings configuration ──
+  const [saccoSettings, setSaccoSettings] = useState({
+    sacco_name: "2KM SACCO",
+    location: "",
+    po_box: "",
+    phone_number: ""
+  });
 
   // ── Receipt state ──
   const [routes, setRoutes]   = useState([]);
@@ -39,8 +44,10 @@ export default function StageOperator() {
   const [showMatatuDrop, setShowMatatuDrop] = useState(false);
   const [draft, setDraft]     = useState(null);
   const [submitted, setSubmitted] = useState(false);
+  const [vehicleTripCount, setVehicleTripCount] = useState(0);
+
   const [form, setForm] = useState({
-    sacco_name: "Matatu SACCO", matatu_id:"", plate:"", owner_name:"",
+    sacco_name: "2KM SACCO", matatu_id:"", plate:"", owner_name:"",
     route_id:"", from_stage:"", to_stage:"", shimo_fee:"", capacity:"",
     mode_of_payment:"Cash", date_issued: new Date().toISOString().split("T")[0],
     operator_membership_no: user?.membership_no || ""
@@ -50,89 +57,209 @@ export default function StageOperator() {
   const [receipts, setReceipts]     = useState([]);
   const [filterDate, setFilterDate] = useState(new Date().toISOString().split("T")[0]);
 
-  // ── Daily summary ──
+  // ── Daily summary & Vehicle Tracker State ──
   const [showSummary, setShowSummary]       = useState(false);
   const [summaryDate, setSummaryDate]       = useState(new Date().toISOString().split("T")[0]);
   const [summary, setSummary]               = useState(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
 
-  // ── Savings ──
-  const [savingsData, setSavingsData] = useState({ balance: 0, transactions: [] });
-  const [savingForm, setSavingForm]   = useState({ amount:"", description:"", date: new Date().toISOString().split("T")[0] });
-  const [savingLoading, setSavingLoading] = useState(false);
+  // Tracking states
+  const [trackerPlate, setTrackerPlate]     = useState("");
+  const [trackerDate, setTrackerDate]       = useState(new Date().toISOString().split("T")[0]);
+  const [trackerResult, setTrackerResult]   = useState(null);
+  const [cumulativeSummary, setCumulativeSummary] = useState(null);
 
-  // ── Guarantor history ──
-  const [guarantorHistory, setGuarantorHistory] = useState([]);
-  const [loadingGuarantors, setLoadingGuarantors] = useState(false);
+  const fetchMatatusList = () => {
+    fetch(`${API}/matatus`).then(r => r.json()).then(data => setMatatus(Array.isArray(data) ? data : [])).catch(() => {});
+  };
 
-  // ── fetch ──
+  const fetchRoutesList = () => {
+    fetch(`${API}/routes`).then(r => r.json()).then(data => setRoutes(Array.isArray(data) ? data : [])).catch(() => {});
+  };
+
   useEffect(() => {
-    fetch(`${API}/routes`).then(r => r.json()).then(setRoutes);
-    fetch(`${API}/matatus`).then(r => r.json()).then(setMatatus);
+    fetchRoutesList();
+    fetchMatatusList();
+
+    fetch(`${API}/settings/sacco`, { headers })
+      .then(r => r.ok ? r.json() : null)
+      .then(data => {
+        if (data && !Array.isArray(data)) {
+          setSaccoSettings(data);
+          setForm(f => ({ ...f, sacco_name: data.sacco_name || "2KM SACCO" }));
+        }
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => { fetchReceipts(); }, [filterDate]);
-  useEffect(() => {
-    if (activeTab === "savings") fetchSavings();
-    if (activeTab === "guarantorHistory") fetchGuarantorHistory();
-  }, [activeTab]);
 
   const fetchReceipts = async () => {
     const res = await fetch(`${API}/receipts/my?date=${filterDate}`, { headers });
-    setReceipts(Array.isArray(await res.json()) ? await (await fetch(`${API}/receipts/my?date=${filterDate}`,{headers})).json() : []);
+    if(res.ok) {
+      const data = await res.json();
+      setReceipts(Array.isArray(data) ? data : []);
+    }
   };
 
-  const fetchSavings = async () => {
-    const res = await fetch(`${API}/savings/my`, { headers });
-    if (res.ok) setSavingsData(await res.json());
-  };
-
-  const fetchGuarantorHistory = async () => {
-    setLoadingGuarantors(true);
-    const res = await fetch(`${API}/guarantors/my-history`, { headers });
-    if (res.ok) setGuarantorHistory(await res.json());
-    setLoadingGuarantors(false);
-  };
-
-  // ── receipt helpers ──
   const filteredMatatus = matatus.filter(m =>
     m.plate?.toLowerCase().includes(matatuSearch.toLowerCase())
   );
 
+  // ── DYNAMIC ROUTE CHANGE HANDLER ──
   const handleRouteChange = (routeId) => {
     const route = routes.find(r => r.id === parseInt(routeId));
-    if (route) setForm(f => ({ ...f, route_id: route.id, from_stage: route.from_stage, to_stage: route.to_stage, shimo_fee: route.shimo_fee }));
+    if (route) {
+      const feeToApply = vehicleTripCount > 0 
+        ? (parseFloat(route.subsequent_fee) || 100) 
+        : parseFloat(route.shimo_fee);
+
+      setForm(f => ({
+        ...f,
+        route_id: route.id,
+        from_stage: route.from_stage,
+        to_stage: route.to_stage,
+        shimo_fee: feeToApply
+      }));
+
+      if (vehicleTripCount > 0) {
+        showToast(`ℹ️ Subsequent trip rate applied: KES ${feeToApply} (Trip #${vehicleTripCount + 1})`, "success");
+      }
+    } else {
+      setForm(f => ({ ...f, route_id: "", from_stage: "", to_stage: "", shimo_fee: "" }));
+    }
   };
 
-  const selectMatatu = (matatu) => {
-    setForm(f => ({ ...f, matatu_id: matatu.id, plate: matatu.plate, owner_name: matatu.owner_member_no || "", capacity: matatu.capacity || "" }));
-    setMatatuSearch(matatu.plate); setShowMatatuDrop(false);
+  // ── SELECT MATATU HANDLER ──
+  const selectMatatu = async (matatu) => {
+    const cleanPlate = (matatu.plate || "").trim().toUpperCase();
+    setMatatuSearch(cleanPlate); 
+    setShowMatatuDrop(false);
+
+    let tripsToday = 0;
+
+    // Automated backend check for trips made today
+    try {
+      const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(cleanPlate)}&date=${form.date_issued}`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        tripsToday = data.trip_count || 0;
+        setVehicleTripCount(tripsToday);
+      }
+    } catch (err) {
+      console.error("Failed to check vehicle trip status", err);
+    }
+
+    // Resolve route fee accurately
+    const targetRouteId = form.route_id || matatu.route_id;
+    const currentRoute = routes.find(r => r.id === parseInt(targetRouteId));
+    
+    let calculatedFee = 100;
+    if (currentRoute) {
+      calculatedFee = tripsToday > 0 
+        ? (parseFloat(currentRoute.subsequent_fee) || 100) 
+        : parseFloat(currentRoute.shimo_fee);
+    } else {
+      calculatedFee = tripsToday > 0 ? 100 : (form.shimo_fee || 200);
+    }
+
+    setForm(f => ({
+      ...f,
+      matatu_id: matatu.id,
+      plate: cleanPlate,
+      owner_name: matatu.owner_member_no || "",
+      capacity: matatu.capacity || "",
+      route_id: currentRoute ? currentRoute.id : f.route_id,
+      from_stage: currentRoute ? currentRoute.from_stage : f.from_stage,
+      to_stage: currentRoute ? currentRoute.to_stage : f.to_stage,
+      shimo_fee: calculatedFee
+    }));
+
+    if (tripsToday > 0) {
+      showToast(`ℹ️ ${cleanPlate} has already made ${tripsToday} trip(s) today. Fee automatically adjusted to subsequent rate: KES ${calculatedFee} (Trip #${tripsToday + 1}).`, "success");
+    } else {
+      showToast(`✅ ${cleanPlate} selected for 1st Trip (KES ${calculatedFee}).`, "success");
+    }
+  };
+
+  // ── STRICT VALIDATION GUARD FOR MULTI-TRIP RULE ──
+  const checkVehicleTripRule = async () => {
+    if (!form.plate || !form.date_issued) return true;
+    try {
+      const cleanPlate = form.plate.trim().toUpperCase();
+      const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(cleanPlate)}&date=${form.date_issued}`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.trip_count > 0) {
+          const currentRoute = routes.find(r => r.id === parseInt(form.route_id));
+          const maxAllowedSubsequentFee = currentRoute ? (parseFloat(currentRoute.subsequent_fee) || 100) : 100;
+          if (parseFloat(form.shimo_fee) > maxAllowedSubsequentFee) {
+            showToast(`⚠️ Vehicle ${cleanPlate} has already completed a trip today! Subsequent trip fee must be KES ${maxAllowedSubsequentFee}.`, "error");
+            return false;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Trip verification check error", e);
+    }
+    return true;
   };
 
   const saveDraft = async () => {
-    if (!form.matatu_id || !form.route_id || !form.mode_of_payment) return showToast("Fill in matatu, route, and payment mode", "error");
+    if (!form.matatu_id || !form.route_id || !form.mode_of_payment) {
+      return showToast("Fill in matatu, route, and payment mode", "error");
+    }
+    
+    const isValidTripFee = await checkVehicleTripRule();
+    if (!isValidTripFee) return;
+
+    const payload = {
+      ...form,
+      sacco_name: saccoSettings.sacco_name,
+      location: saccoSettings.location,
+      po_box: saccoSettings.po_box,
+      phone_number: saccoSettings.phone_number,
+      issued_by: user?.id,
+      operator_membership_no: user?.membership_no
+    };
     const res = await fetch(`${API}/receipts`, {
       method: "POST", headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify({ ...form, issued_by: user?.id, operator_membership_no: user?.membership_no })
+      body: JSON.stringify(payload)
     });
     const data = await res.json();
     if (!res.ok) return showToast(data.error || "Failed to save draft", "error");
-    setDraft({ ...form, id: data.id, ticket_number: data.ticket_number });
+    setDraft({ ...payload, id: data.id, ticket_number: data.ticket_number });
     setSubmitted(false);
     showToast(`Draft saved — ${data.ticket_number}`);
   };
 
   const updateDraft = async () => {
     if (!draft?.id) return;
+    const isValidTripFee = await checkVehicleTripRule();
+    if (!isValidTripFee) return;
+
+    const payload = {
+      ...form,
+      sacco_name: saccoSettings.sacco_name,
+      location: saccoSettings.location,
+      po_box: saccoSettings.po_box,
+      phone_number: saccoSettings.phone_number
+    };
     const res = await fetch(`${API}/receipts/${draft.id}`, {
-      method: "PUT", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(form)
+      method: "PUT", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(payload)
     });
     if (!res.ok) { const d = await res.json(); return showToast(d.error || "Update failed", "error"); }
-    setDraft({ ...draft, ...form }); showToast("Draft updated ✓");
+    setDraft({ ...draft, ...payload }); showToast("Draft updated ✓");
   };
 
   const submitReceipt = async () => {
     if (!draft?.id) return showToast("Save a draft first", "error");
+    const isValidTripFee = await checkVehicleTripRule();
+    if (!isValidTripFee) {
+      showToast("Cannot submit: Adjust fee for subsequent trip rate!", "error");
+      return;
+    }
+
     if (!window.confirm("Submit this receipt? It cannot be edited after submission.")) return;
     const res = await fetch(`${API}/receipts/${draft.id}/submit`, { method: "PUT", headers });
     if (!res.ok) { const d = await res.json(); return showToast(d.error || "Submit failed", "error"); }
@@ -141,66 +268,108 @@ export default function StageOperator() {
   };
 
   const resetForm = () => {
-    setDraft(null); setSubmitted(false); setMatatuSearch("");
+    setDraft(null); setSubmitted(false); setMatatuSearch(""); setVehicleTripCount(0);
+    fetchMatatusList(); // Refresh matatus list in background
     setForm({
-      sacco_name:"Matatu SACCO", matatu_id:"", plate:"", owner_name:"",
+      sacco_name: saccoSettings.sacco_name || "2KM SACCO", matatu_id:"", plate:"", owner_name:"",
       route_id:"", from_stage:"", to_stage:"", shimo_fee:"", capacity:"",
       mode_of_payment:"Cash", date_issued: new Date().toISOString().split("T")[0],
       operator_membership_no: user?.membership_no || ""
     });
   };
 
-  const printReceipt = (r) => {
+  // ── SLIP PRINTING ──
+  const printReceipt = async (r) => {
+    let tripNumber = 1;
+    let isFirstTrip = true;
+
+    try {
+      const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(r.plate)}&date=${r.date_issued}`, { headers });
+      if (res.ok) {
+        const data = await res.json();
+        const count = data.trip_count || 1;
+        if (parseFloat(r.shimo_fee) >= 200 && count <= 1) {
+          isFirstTrip = true;
+          tripNumber = 1;
+        } else {
+          isFirstTrip = false;
+          tripNumber = count > 1 ? count : 2;
+        }
+      }
+    } catch {
+      isFirstTrip = parseFloat(r.shimo_fee) >= 200;
+    }
+
     const win = window.open("", "_blank");
     win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
-      <style>body{font-family:monospace;padding:20px;max-width:400px;margin:auto;}
-      h2{text-align:center;}.line{display:flex;justify-content:space-between;margin:6px 0;border-bottom:1px dashed #ccc;padding-bottom:4px;}
-      .ticket{text-align:center;font-size:20px;font-weight:bold;margin:16px 0;letter-spacing:2px;}
-      .footer{text-align:center;margin-top:20px;font-size:12px;color:#666;}</style></head>
-      <body><h2>${r.sacco_name||"Matatu SACCO"}</h2>
-      <div class="ticket">🎫 ${r.ticket_number}</div>
-      <div class="line"><span>Plate:</span><span>${r.plate}</span></div>
-      <div class="line"><span>Owner:</span><span>${r.owner_name||"N/A"}</span></div>
-      <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
-      <div class="line"><span>Shimo Fee:</span><span>KES ${r.shimo_fee}</span></div>
-      <div class="line"><span>Capacity:</span><span>${r.capacity||"N/A"}</span></div>
-      <div class="line"><span>Payment:</span><span>${r.mode_of_payment}</span></div>
-      <div class="line"><span>Operator:</span><span>${r.operator_membership_no}</span></div>
-      <div class="line"><span>Date:</span><span>${r.date_issued}</span></div>
-      <div class="line"><span>Time:</span><span>${r.time_issued||""}</span></div>
-      <div class="footer">This receipt is valid and cannot be altered.</div>
+      <style>
+        body{font-family:monospace;padding:20px;max-width:380px;margin:auto;}
+        h2{text-align:center;margin-bottom:2px;}
+        .meta{text-align:center;font-size:11px;color:#555;margin-bottom:12px;}
+        .line{display:flex;justify-content:space-between;margin:6px 0;border-bottom:1px dashed #ddd;padding-bottom:4px;font-size:13px;}
+        .ticket{text-align:center;font-size:18px;font-weight:bold;margin:14px 0;background:#f4f4f4;padding:6px;border-radius:4px;}
+        .highlight{font-weight:bold;color:#000;font-size:14px;}
+        .footer{text-align:center;margin-top:20px;font-size:11px;color:#666;}
+      </style></head>
+      <body>
+        <h2>${r.sacco_name || "2KM SACCO"}</h2>
+        <div class="meta">
+          ${r.location ? `<div>📍 ${r.location}</div>` : ""}
+          ${r.phone_number ? `<div>📞 Helpline: ${r.phone_number}</div>` : ""}
+        </div>
+        <div class="ticket">🎫 ${r.ticket_number}</div>
+        <div class="line"><span>Vehicle Plate:</span><span class="highlight">${r.plate}</span></div>
+        <div class="line"><span>Owner Member:</span><span>${r.owner_name || "N/A"}</span></div>
+        <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
+
+        ${isFirstTrip ? `
+          <div class="line highlight" style="border-top:1px solid #000;border-bottom:1px solid #000;padding:6px 0;background:#f9f9f9;">
+            <span>Owner Savings Credited:</span><span>KES 50.00</span>
+          </div>
+        ` : `
+          <div class="line highlight" style="border-top:1px solid #000;border-bottom:1px solid #000;padding:6px 0;background:#f9f9f9;">
+            <span>Daily Trip Cleared:</span><span>Trip #${tripNumber}</span>
+          </div>
+        `}
+
+        <div class="line"><span>Fee Paid:</span><span class="highlight">KES ${r.shimo_fee}</span></div>
+        <div class="line"><span>Date Issued:</span><span>${r.date_issued}</span></div>
+        <div class="line"><span>Time Issued:</span><span>${r.time_issued || ""}</span></div>
+        <div class="line"><span>Operator No:</span><span>${r.operator_membership_no || user?.membership_no || "N/A"}</span></div>
+
+        <div class="footer">
+          ${isFirstTrip 
+            ? `*** Official Matatu Owner Savings Slip ***<br/>Stage Clearance Verified` 
+            : `*** Stage Clearance Slip (Trip #${tripNumber}) ***<br/>Welfare Split Allocated`}
+        </div>
       </body></html>`);
-    win.document.close(); setTimeout(() => win.print(), 500);
+    win.document.close();
+    setTimeout(() => win.print(), 500);
   };
 
   const fetchSummary = async () => {
     setSummaryLoading(true);
     const res = await fetch(`${API}/receipts/summary?date=${summaryDate}`, { headers });
     if (res.ok) setSummary(await res.json());
+
+    const cumRes = await fetch(`${API}/stage/delivery-summary?date=${summaryDate}`, { headers });
+    if (cumRes.ok) setCumulativeSummary(await cumRes.json());
+
     setSummaryLoading(false);
   };
 
-  const depositSaving = async () => {
-    if (!savingForm.amount) return showToast("Amount required", "error");
-    setSavingLoading(true);
-    const res = await fetch(`${API}/savings/deposit`, {
-      method:"POST", headers:{ ...headers, "Content-Type":"application/json" },
-      body: JSON.stringify({ amount: parseFloat(savingForm.amount), description: savingForm.description, date: savingForm.date })
-    });
-    setSavingLoading(false);
-    if (!res.ok) return showToast("Deposit failed", "error");
-    showToast("Savings deposited ✓");
-    setSavingForm({ amount:"", description:"", date: new Date().toISOString().split("T")[0] });
-    fetchSavings();
+  const lookupVehicleTracker = async (e) => {
+    e.preventDefault();
+    if (!trackerPlate) return showToast("Enter a vehicle plate", "error");
+    const res = await fetch(`${API}/stage/vehicle-performance?plate=${trackerPlate.trim().toUpperCase()}&date=${trackerDate}`, { headers });
+    if (res.ok) {
+      setTrackerResult(await res.json());
+    } else {
+      showToast("Failed to fetch tracker history", "error");
+    }
   };
 
-  const routeColors = ["#3B82F6","#10B981","#F59E0B","#EF4444","#8B5CF6","#EC4899"];
-
-  const GUARANTEE_STATUS = {
-    pending:  { color:"bg-yellow-100 text-yellow-700", icon:"⏳" },
-    accepted: { color:"bg-green-100 text-green-700",   icon:"✅" },
-    rejected: { color:"bg-red-100 text-red-700",       icon:"❌" },
-  };
+  const handleLogout = () => { logout(); navigate("/"); };
 
   return (
     <div className="flex min-h-screen bg-gray-100">
@@ -227,14 +396,13 @@ export default function StageOperator() {
           ))}
           <button onClick={() => setShowSummary(true)}
             className="w-full text-left p-3 rounded text-sm text-gray-400 hover:bg-gray-700 hover:text-white font-medium">
-            📊 Daily Summary
+            📊 Daily Summary & Tracker
           </button>
         </nav>
 
-        <div className="pt-4 border-t border-gray-800 text-xs text-gray-500 space-y-1">
-          <p>Receipts: <span className="text-white font-bold">{receipts.length}</span></p>
-          <p>Savings: <span className="text-blue-400 font-bold">KES {savingsData.balance?.toLocaleString()||0}</span></p>
-        </div>
+        <button onClick={handleLogout} className="mt-4 w-full p-3 rounded text-sm bg-red-600 hover:bg-red-500 text-white font-bold transition-all">
+          🚪 Logout
+        </button>
       </div>
 
       {/* CONTENT */}
@@ -243,21 +411,25 @@ export default function StageOperator() {
         {/* ISSUE RECEIPT */}
         {activeTab === "issue" && (
           <div className="max-w-2xl mx-auto">
-            <h2 className="text-2xl font-bold mb-6 text-gray-800">🎫 Issue Receipt</h2>
+            <h2 className="text-2xl font-bold mb-6 text-gray-800">🎫 Issue Main Stage Receipt</h2>
             <div className="bg-white rounded-xl shadow p-6 space-y-4">
-
+              
               <div>
-                <label className="text-sm font-medium text-gray-700">SACCO / Company Name</label>
-                <input value={form.sacco_name} onChange={e => setForm({...form,sacco_name:e.target.value})}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted} />
+                <label className="text-sm font-medium text-gray-700">SACCO Details (Receipt Header)</label>
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-3.5 mt-1 text-xs text-gray-600 space-y-1 shadow-inner">
+                  <p className="font-bold text-sm text-gray-800">🏢 {saccoSettings.sacco_name}</p>
+                  {saccoSettings.location && <p>📍 Address: {saccoSettings.location}</p>}
+                  {saccoSettings.po_box && <p>📬 PO Box: {saccoSettings.po_box}</p>}
+                  {saccoSettings.phone_number && <p>📞 Hotline: {saccoSettings.phone_number}</p>}
+                </div>
               </div>
 
               <div className="relative">
                 <label className="text-sm font-medium text-gray-700">Matatu Plate</label>
                 <input type="text" placeholder="Search plate number..." value={matatuSearch}
                   onChange={e => { setMatatuSearch(e.target.value); setShowMatatuDrop(true); }}
-                  onFocus={() => setShowMatatuDrop(true)}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white"
+                  onFocus={() => { fetchMatatusList(); setShowMatatuDrop(true); }}
+                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white uppercase font-bold"
                   disabled={submitted} />
                 {showMatatuDrop && matatuSearch && (
                   <div className="absolute z-50 bg-white border border-gray-200 w-full max-h-48 overflow-y-auto shadow-lg rounded-lg mt-1">
@@ -273,35 +445,38 @@ export default function StageOperator() {
 
               <div>
                 <label className="text-sm font-medium text-gray-700">Owner Name / Member No</label>
-                <input value={form.owner_name} onChange={e => setForm({...form,owner_name:e.target.value})}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-gray-50 text-gray-700 outline-none" placeholder="Auto-filled" disabled={submitted} />
+                <input value={form.owner_name} readOnly className="border p-2.5 w-full rounded-lg mt-1 bg-gray-50 text-gray-700" />
               </div>
 
               <div>
                 <label className="text-sm font-medium text-gray-700">Route</label>
-                <select value={form.route_id} onChange={e => handleRouteChange(e.target.value)}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted}>
+                <select 
+                  value={form.route_id} 
+                  onChange={e => handleRouteChange(e.target.value)}
+                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-gray-800" 
+                  disabled={submitted}
+                >
                   <option value="">Select Route</option>
-                  {routes.map(r => <option key={r.id} value={r.id}>{r.from_stage} → {r.to_stage} (KES {r.shimo_fee})</option>)}
+                  {routes.map(r => (
+                    <option key={r.id} value={r.id}>
+                      {r.from_stage} → {r.to_stage} (1st: KES {r.shimo_fee} | 2nd+: KES {r.subsequent_fee || 100})
+                    </option>
+                  ))}
                 </select>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                {[["From Stage",form.from_stage],["To Stage",form.to_stage]].map(([l,v]) => (
-                  <div key={l}>
-                    <label className="text-sm font-medium text-gray-700">{l}</label>
-                    <input value={v} readOnly className="border p-2.5 w-full rounded-lg mt-1 bg-gray-50 text-gray-700" />
-                  </div>
-                ))}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="text-sm font-medium text-gray-700">Shimo Fee (KES)</label>
                   <input type="number" value={form.shimo_fee} onChange={e => setForm({...form,shimo_fee:e.target.value})}
-                    className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted} />
+                    className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-gray-800 font-bold text-blue-700" disabled={submitted} />
+                  {vehicleTripCount > 0 ? (
+                    <p className="text-[10px] text-purple-700 font-bold mt-1">✓ Trip #{vehicleTripCount + 1}: Subsequent rate active.</p>
+                  ) : (
+                    <p className="text-[10px] text-gray-500 mt-1">1st Trip standard route rate.</p>
+                  )}
                 </div>
-                <div>
+                 <div>
                   <label className="text-sm font-medium text-gray-700">Capacity</label>
                   <input type="number" value={form.capacity} onChange={e => setForm({...form,capacity:e.target.value})}
                     placeholder="e.g. 14" className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted} />
@@ -311,22 +486,16 @@ export default function StageOperator() {
               <div>
                 <label className="text-sm font-medium text-gray-700">Mode of Payment</label>
                 <select value={form.mode_of_payment} onChange={e => setForm({...form,mode_of_payment:e.target.value})}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted}>
+                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-gray-800" disabled={submitted}>
                   <option value="Cash">Cash</option>
                   <option value="Mpesa">Mpesa</option>
                 </select>
               </div>
 
               <div>
-                <label className="text-sm font-medium text-gray-700">Operator Membership No</label>
-                <input value={form.operator_membership_no} onChange={e => setForm({...form,operator_membership_no:e.target.value})}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-gray-50 text-gray-700 outline-none" disabled={submitted} />
-              </div>
-
-              <div>
                 <label className="text-sm font-medium text-gray-700">Date</label>
                 <input type="date" value={form.date_issued} onChange={e => setForm({...form,date_issued:e.target.value})}
-                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted} />
+                  className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-gray-800" disabled={submitted} />
               </div>
 
               {draft?.ticket_number && (
@@ -347,7 +516,7 @@ export default function StageOperator() {
                   <button onClick={submitReceipt} className="bg-green-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-green-700">✅ Submit</button>
                 </>)}
                 {submitted && (<>
-                  <button onClick={() => printReceipt({...form,...draft})} className="bg-purple-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-purple-700">🖨️ Print</button>
+                  <button onClick={() => printReceipt({...form,...draft})} className="bg-purple-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-purple-700">🖨️ Print Slip</button>
                   <button onClick={resetForm} className="bg-blue-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-blue-700">+ New Receipt</button>
                 </>)}
               </div>
@@ -360,11 +529,8 @@ export default function StageOperator() {
           <div>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-2xl font-bold text-gray-800">📋 My Receipts</h2>
-              <div className="flex items-center gap-2">
-                <label className="text-sm text-gray-600">Date:</label>
-                <input type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)}
-                  className="border border-gray-300 p-2 rounded-lg text-sm text-gray-800 bg-white outline-none" />
-              </div>
+              <input type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)}
+                className="border border-gray-300 p-2 rounded-lg text-sm text-gray-800 bg-white" />
             </div>
             {receipts.length === 0 ? (
               <div className="bg-white rounded-xl shadow p-8 text-center text-gray-500">No receipts for {filterDate}</div>
@@ -374,71 +540,10 @@ export default function StageOperator() {
                   <div key={r.id} className="bg-white rounded-xl shadow p-4 flex justify-between items-center">
                     <div>
                       <p className="font-bold text-blue-700">{r.ticket_number}</p>
-                      <p className="text-sm text-gray-600">{r.plate} — {r.from_stage} → {r.to_stage}</p>
-                      <p className="text-sm text-gray-500">KES {r.shimo_fee} · {r.mode_of_payment} · {r.time_issued}</p>
+                      <p className="text-sm text-gray-600">{r.plate} — {r.from_stage} → {r.to_stage} | Fee: KES {r.shimo_fee}</p>
+                      <p className="text-xs text-gray-400">Date: {r.date_issued} {r.time_issued}</p>
                     </div>
-                    <button onClick={() => printReceipt(r)} className="bg-purple-600 text-white px-3 py-1.5 rounded-lg text-sm hover:bg-purple-700">🖨️ Print</button>
-                  </div>
-                ))}
-                <div className="bg-gray-800 text-white rounded-xl p-4 flex justify-between">
-                  <span>Total: <b>{receipts.length}</b></span>
-                  <span>Collected: <b>KES {receipts.reduce((s,r)=>s+r.shimo_fee,0).toLocaleString()}</b></span>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* SAVINGS */}
-        {activeTab === "savings" && (
-          <div className="max-w-2xl">
-            <h2 className="text-2xl font-bold text-gray-800 mb-2">🏦 Personal Savings</h2>
-            <p className="text-gray-500 text-sm mb-6">Your personal SACCO savings. Private to you.</p>
-            <div className="bg-gradient-to-br from-blue-700 to-blue-600 rounded-xl p-6 mb-6 text-white">
-              <p className="text-blue-200 text-xs uppercase tracking-widest mb-1">Current Balance</p>
-              <p className="text-4xl font-black">KES {savingsData.balance?.toLocaleString()||0}</p>
-            </div>
-            <div className="bg-white rounded-xl shadow p-6 mb-6">
-              <h3 className="font-bold text-gray-700 mb-4 text-sm uppercase tracking-widest">Make a Deposit</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                <div>
-                  <label className="text-xs text-gray-500 uppercase tracking-widest mb-1 block">Amount (KES)</label>
-                  <input type="number" placeholder="e.g. 1000" value={savingForm.amount}
-                    onChange={e => setSavingForm({...savingForm,amount:e.target.value})}
-                    className="w-full border border-gray-300 rounded-lg p-2.5 text-sm text-gray-800 bg-white outline-none focus:border-blue-500" />
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 uppercase tracking-widest mb-1 block">Date</label>
-                  <input type="date" value={savingForm.date}
-                    onChange={e => setSavingForm({...savingForm,date:e.target.value})}
-                    className="w-full border border-gray-300 rounded-lg p-2.5 text-sm text-gray-800 bg-white outline-none focus:border-blue-500" />
-                </div>
-              </div>
-              <div className="mb-4">
-                <label className="text-xs text-gray-500 uppercase tracking-widest mb-1 block">Description (optional)</label>
-                <input placeholder="e.g. Monthly savings" value={savingForm.description}
-                  onChange={e => setSavingForm({...savingForm,description:e.target.value})}
-                  className="w-full border border-gray-300 rounded-lg p-2.5 text-sm text-gray-800 bg-white outline-none focus:border-blue-500" />
-              </div>
-              <button onClick={depositSaving} disabled={savingLoading}
-                className="bg-blue-600 text-white font-bold px-6 py-2.5 rounded-lg hover:bg-blue-700 disabled:opacity-50">
-                {savingLoading ? "Depositing..." : "💳 Deposit"}
-              </button>
-            </div>
-            <h3 className="font-bold text-gray-600 mb-3 text-sm uppercase tracking-widest">Transaction History</h3>
-            {(!savingsData.transactions||savingsData.transactions.length===0) ? (
-              <div className="bg-white rounded-xl shadow p-8 text-center text-gray-400">No transactions yet</div>
-            ) : (
-              <div className="space-y-2">
-                {savingsData.transactions.map(t => (
-                  <div key={t.id} className="bg-white rounded-xl shadow p-4 flex justify-between items-center">
-                    <div>
-                      <p className="text-sm font-medium text-gray-700">{t.description||"Deposit"}</p>
-                      <p className="text-xs text-gray-400">{t.date}</p>
-                    </div>
-                    <p className={`font-black ${t.transaction_type==="deposit"?"text-blue-600":"text-red-500"}`}>
-                      {t.transaction_type==="deposit"?"+":"-"}KES {t.amount?.toLocaleString()}
-                    </p>
+                    <button onClick={() => printReceipt(r)} className="bg-purple-600 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-purple-700">🖨️ Print Slip</button>
                   </div>
                 ))}
               </div>
@@ -446,111 +551,82 @@ export default function StageOperator() {
           </div>
         )}
 
-        {/* LOANS — stage operators CAN apply */}
-        {activeTab === "loans" && <LoanDashboard />}
-
-        {/* GUARANTOR HISTORY */}
-        {activeTab === "guarantorHistory" && (
-          <div>
-            <h2 className="text-2xl font-bold text-gray-800 mb-2">🤝 Guarantor History</h2>
-            <p className="text-gray-500 text-sm mb-6">All loans you have been asked to guarantee — permanently visible after responding.</p>
-            <button onClick={fetchGuarantorHistory} className="mb-4 bg-gray-200 text-gray-700 text-xs px-3 py-1.5 rounded hover:bg-gray-300 font-bold">
-              🔄 Refresh
-            </button>
-            {loadingGuarantors ? (
-              <div className="text-center text-gray-500 py-8">Loading...</div>
-            ) : guarantorHistory.length === 0 ? (
-              <div className="bg-white rounded-xl shadow p-8 text-center text-gray-400">
-                <p className="text-4xl mb-2">🤝</p><p>No guarantor history yet</p>
-              </div>
-            ) : (
-              <div className="space-y-4">
-                {guarantorHistory.map(g => (
-                  <div key={g.id} className={`bg-white rounded-xl shadow p-5 border-l-4 ${g.status==="accepted"?"border-green-500":g.status==="rejected"?"border-red-400":"border-yellow-400"}`}>
-                    <div className="flex justify-between items-start mb-3">
-                      <div>
-                        <p className="font-black text-gray-800">{g.member_name}</p>
-                        <p className="text-gray-400 text-sm">{g.membership_no} · {g.loan_type} loan</p>
-                      </div>
-                      <span className={`text-xs px-3 py-1 rounded-full font-bold ${(GUARANTEE_STATUS[g.status]||{}).color}`}>
-                        {(GUARANTEE_STATUS[g.status]||{}).icon} {g.status}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3 text-sm mb-2">
-                      <div className="bg-gray-50 rounded-lg p-3">
-                        <p className="text-gray-400 text-xs">Loan Amount</p>
-                        <p className="font-black text-gray-800">KES {g.loan_amount?.toLocaleString()}</p>
-                      </div>
-                      <div className="bg-gray-50 rounded-lg p-3">
-                        <p className="text-gray-400 text-xs">Loan Status</p>
-                        <p className="font-bold text-gray-700 capitalize">{g.loan_status?.replace(/_/g," ")}</p>
-                      </div>
-                    </div>
-                    <p className="text-gray-500 text-xs">Purpose: {g.loan_purpose}</p>
-                    {g.status === "accepted" && (
-                      <div className="mt-3 bg-green-50 border border-green-200 rounded-lg p-3 text-xs">
-                        <p className="text-green-700 font-bold mb-1">✅ Active guarantor</p>
-                        <div className="flex gap-4 text-gray-600">
-                          <span>Repaid: <span className="text-green-600 font-bold">KES {g.amount_repaid?.toLocaleString()}</span></span>
-                          <span>Outstanding: <span className="text-red-500 font-bold">KES {((g.total_payable||0)-(g.amount_repaid||0)).toLocaleString()}</span></span>
-                        </div>
-                      </div>
-                    )}
-                    <p className="text-gray-400 text-xs mt-2">{new Date(g.created_at).toLocaleDateString()}{g.responded_at&&` · Responded: ${new Date(g.responded_at).toLocaleDateString()}`}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+        {/* STAGE & EXPENSES DESK */}
+        {activeTab === "stageOperations" && (
+          <StageExpensesAndWelfare user={user} />
         )}
       </div>
 
-      {/* DAILY SUMMARY MODAL */}
+      {/* ── EXPANDED DAILY SUMMARY & TRACKER MODAL ── */}
       {showSummary && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-xl shadow-2xl w-[500px] max-h-[90vh] overflow-y-auto p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-xl font-bold text-gray-800">📊 Daily Summary</h3>
-              <button onClick={() => setShowSummary(false)} className="text-gray-400 hover:text-gray-700 text-xl">✕</button>
+          <div className="bg-white rounded-xl shadow-2xl w-[600px] max-h-[90vh] overflow-y-auto p-6 space-y-6">
+            
+            <div className="flex justify-between items-center border-b pb-3">
+              <h3 className="text-xl font-bold text-gray-800">📊 Daily Summary & Vehicle Tracker</h3>
+              <button onClick={() => setShowSummary(false)} className="text-gray-400 hover:text-gray-700 text-xl font-bold">✕</button>
             </div>
-            <div className="flex gap-3 mb-4">
-              <input type="date" value={summaryDate} onChange={e => setSummaryDate(e.target.value)}
-                className="border border-gray-300 p-2.5 rounded-lg flex-1 text-gray-800 bg-white outline-none focus:border-blue-500" />
-              <button onClick={fetchSummary} className="bg-blue-600 text-white px-4 py-2.5 rounded-lg hover:bg-blue-700 font-bold">View</button>
-            </div>
-            {summaryLoading && <p className="text-center text-gray-500 py-4">Loading...</p>}
-            {summary && !summaryLoading && (
-              <>
-                <div className="grid grid-cols-2 gap-3 mb-4">
-                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-center">
-                    <p className="text-3xl font-black text-blue-700">{summary.total_tickets}</p>
-                    <p className="text-sm text-blue-600 mt-1">Tickets Issued</p>
+
+            <div>
+              <label className="text-xs font-bold text-gray-600 uppercase">Select Summary Date</label>
+              <div className="flex gap-3 mt-1">
+                <input type="date" value={summaryDate} onChange={e => setSummaryDate(e.target.value)}
+                  className="border border-gray-300 p-2 rounded-lg flex-1 text-gray-800 bg-white" />
+                <button onClick={fetchSummary} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold text-xs hover:bg-blue-700">Load Report</button>
+              </div>
+
+              {summaryLoading && <p className="text-center text-gray-500 py-3 text-xs">Loading summary...</p>}
+
+              {summary && !summaryLoading && (
+                <div className="grid grid-cols-2 gap-3 mt-3">
+                  <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 text-center">
+                    <p className="text-2xl font-black text-blue-700">{summary.total_tickets}</p>
+                    <p className="text-xs text-blue-600 mt-0.5">Total Tickets Issued</p>
                   </div>
-                  <div className="bg-green-50 border border-green-200 rounded-xl p-4 text-center">
-                    <p className="text-2xl font-black text-green-700">KES {summary.total_amount?.toLocaleString()}</p>
-                    <p className="text-sm text-green-600 mt-1">Total Collected</p>
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-center">
+                    <p className="text-xl font-black text-emerald-700">KES {summary.total_amount?.toLocaleString()}</p>
+                    <p className="text-xs text-emerald-600 mt-0.5">Total Revenue Collected</p>
                   </div>
                 </div>
-                <h4 className="font-bold text-gray-700 mb-3">By Route</h4>
-                {Object.keys(summary.by_route||{}).length === 0 ? (
-                  <p className="text-gray-500 text-sm text-center py-4">No data for this date</p>
-                ) : Object.entries(summary.by_route).map(([route,data],idx) => {
-                  const maxTotal = Math.max(...Object.values(summary.by_route).map(d=>d.total));
-                  const width = maxTotal > 0 ? (data.total/maxTotal)*100 : 0;
-                  return (
-                    <div key={route} className="mb-3">
-                      <div className="flex justify-between text-sm mb-1">
-                        <span className="text-gray-700 font-medium">{route}</span>
-                        <span className="text-gray-500">{data.count} · KES {data.total.toLocaleString()}</span>
-                      </div>
-                      <div className="w-full bg-gray-100 rounded-full h-4">
-                        <div className="h-4 rounded-full" style={{width:`${width}%`,backgroundColor:routeColors[idx%routeColors.length]}} />
-                      </div>
+              )}
+            </div>
+
+            <div className="border-t pt-4">
+              <h4 className="text-xs font-bold text-gray-800 uppercase tracking-wide mb-2">🔍 Vehicle Performance & Trip History Tracker</h4>
+              <form onSubmit={lookupVehicleTracker} className="bg-gray-50 p-4 rounded-xl border border-gray-200 space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] font-medium text-gray-600">Vehicle Plate</label>
+                    <input type="text" placeholder="e.g., KBC 123A" value={trackerPlate}
+                      onChange={e => setTrackerPlate(e.target.value)}
+                      className="w-full mt-1 border border-gray-300 rounded-lg p-2 text-xs uppercase bg-white text-gray-800" />
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-medium text-gray-600">Date</label>
+                    <input type="date" value={trackerDate} onChange={e => setTrackerDate(e.target.value)}
+                      className="w-full mt-1 border border-gray-300 rounded-lg p-2 text-xs bg-white text-gray-800" />
+                  </div>
+                </div>
+                <button type="submit" className="bg-gray-800 hover:bg-gray-900 text-white font-bold text-xs px-4 py-2 rounded-lg">
+                  Search Vehicle Trips
+                </button>
+              </form>
+
+              {trackerResult && (
+                <div className="mt-3 border border-blue-200 bg-blue-50 p-3 rounded-xl space-y-2 text-xs">
+                  <p className="font-bold text-blue-900">Results for {trackerResult.plate} on {trackerDate}:</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="bg-white p-2 rounded border">
+                      <span className="text-gray-500">Total Trips Made:</span> <b>{trackerResult.total_trips || 0}</b>
                     </div>
-                  );
-                })}
-              </>
-            )}
+                    <div className="bg-white p-2 rounded border">
+                      <span className="text-gray-500">Total Fees Collected:</span> <b className="text-emerald-700">KES {trackerResult.total_collected || 0}</b>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
           </div>
         </div>
       )}

@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import API from "../api";
 import { useAuth } from "../context/AuthContext";
 import LoanDashboard from "./LoanDashboard";
+import Savings from "../components/Savings";
 
 const TABS = [
   { key: "home",         label: "🏠 Overview" },
@@ -89,6 +90,10 @@ export default function OwnerDashboard() {
     date: new Date().toISOString().split("T")[0], proof_file:null, notes:""
   });
   const [paymentLoading, setPaymentLoading] = useState(false);
+  
+  // With this corrected filter (only sum approved ones or legacy unstatused rows):
+  const approvedPayments = saccoPayments.filter(p => p.status === "approved" || !p.status);
+  const totalSaccoPaid = approvedPayments.reduce((s,p)=>s+(p.amount||0),0);
 
   // ─── fetch ───────────────────────────────────────────────────
   const fetchMatatus = useCallback(async () => {
@@ -782,84 +787,7 @@ export default function OwnerDashboard() {
         {/* ══════════════ SAVINGS (OWNER PERSONAL ONLY) ══════════════ */}
         {activeTab === "savings" && (
           <div className="p-8">
-            <h2 className="text-2xl font-black text-stone-800 mb-2">🏦 Savings</h2>
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-6 text-sm text-amber-800">
-              ℹ️ <strong>Personal savings only.</strong> Savings deposited by drivers and conductors are not shown here. To see all matatu savings (including crew), use the <button onClick={() => setActiveTab("records")} className="underline font-bold">Records per Matatu</button> tab.
-            </div>
-
-            <div className="bg-gradient-to-r from-green-800 to-green-700 rounded-xl p-6 mb-6 text-white">
-              <p className="text-green-300 text-xs uppercase tracking-widest mb-1">Personal Savings Balance</p>
-              <p className="text-4xl font-black">KES {savingsData.balance?.toLocaleString()||0}</p>
-              <p className="text-green-300 text-xs mt-2">Your deposits only — driver/conductor savings not included</p>
-            </div>
-
-            {matatus.length > 0 && (
-              <div className="mb-6">
-                <h3 className="font-black text-stone-700 mb-3 text-sm uppercase tracking-widest">Your Deposits per Matatu</h3>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  {matatus.map(m => (
-                    <div key={m.id} onClick={() => fetchMatatuSavings(m.id)}
-                      className="bg-white border border-stone-200 rounded-xl p-4 cursor-pointer hover:border-amber-400 transition-all">
-                      <p className="font-black text-stone-700">🚐 {m.plate}</p>
-                      <p className="text-2xl font-black text-green-600 mt-1">
-                        KES {matatuSavings[m.id]?.balance?.toLocaleString()||"—"}
-                      </p>
-                      <p className="text-xs text-stone-400 mt-1">Your deposits only · Click to load</p>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="bg-white border border-stone-200 rounded-xl p-6 mb-6">
-              <h3 className="font-black text-stone-700 mb-4">Make a Deposit</h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                <div>
-                  <label className="text-xs text-stone-400 uppercase tracking-widest mb-1 block">Amount (KES)</label>
-                  <input type="number" placeholder="e.g. 5000" value={savingForm.amount}
-                    onChange={e => setSavingForm({...savingForm,amount:e.target.value})}
-                    className="w-full border border-stone-300 rounded-lg p-2.5 text-sm focus:border-amber-400 outline-none" />
-                </div>
-                <div>
-                  <label className="text-xs text-stone-400 uppercase tracking-widest mb-1 block">Date</label>
-                  <input type="date" value={savingForm.date}
-                    onChange={e => setSavingForm({...savingForm,date:e.target.value})}
-                    className="w-full border border-stone-300 rounded-lg p-2.5 text-sm focus:border-amber-400 outline-none" />
-                </div>
-                <div>
-                  <label className="text-xs text-stone-400 uppercase tracking-widest mb-1 block">Deposit for Matatu (optional)</label>
-                  <select value={savingForm.matatu_id} onChange={e => setSavingForm({...savingForm,matatu_id:e.target.value})}
-                    className="w-full border border-stone-300 rounded-lg p-2.5 text-sm focus:border-amber-400 outline-none">
-                    <option value="">Personal savings</option>
-                    {matatus.map(m => <option key={m.id} value={m.id}>{m.plate}</option>)}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs text-stone-400 uppercase tracking-widest mb-1 block">Description</label>
-                  <input placeholder="e.g. Monthly deposit" value={savingForm.description}
-                    onChange={e => setSavingForm({...savingForm,description:e.target.value})}
-                    className="w-full border border-stone-300 rounded-lg p-2.5 text-sm focus:border-amber-400 outline-none" />
-                </div>
-              </div>
-              <button onClick={depositSaving} className="bg-amber-500 text-black font-black px-6 py-2.5 rounded-lg hover:bg-amber-400">💳 Deposit</button>
-            </div>
-
-            <h3 className="font-black text-stone-600 mb-3 text-sm uppercase tracking-widest">Personal Transaction History</h3>
-            <div className="space-y-2">
-              {(!savingsData.transactions||savingsData.transactions.length===0) ? (
-                <p className="text-stone-400 text-sm">No personal transactions yet</p>
-              ) : savingsData.transactions.map(t => (
-                <div key={t.id} className="bg-white border border-stone-200 rounded-xl p-4 flex justify-between items-center">
-                  <div>
-                    <p className="text-sm font-medium text-stone-700">{t.description||"Deposit"}</p>
-                    <p className="text-xs text-stone-400">{t.date}{t.matatu_id?` · Matatu #${t.matatu_id}`:""}</p>
-                  </div>
-                  <p className={`font-black ${t.transaction_type==="deposit"?"text-green-600":"text-red-500"}`}>
-                    {t.transaction_type==="deposit"?"+":"-"}KES {t.amount?.toLocaleString()}
-                  </p>
-                </div>
-              ))}
-            </div>
+             <Savings />
           </div>
         )}
 
@@ -921,32 +849,41 @@ export default function OwnerDashboard() {
                 {paymentLoading ? "Submitting..." : "📤 Submit Payment"}
               </button>
             </div>
-            {saccoPayments.length === 0 ? (
-              <div className="bg-white border border-stone-200 rounded-xl p-8 text-center text-stone-400">No payments recorded yet</div>
-            ) : (
-              <div className="space-y-3">
-                {saccoPayments.map(p => {
-                  const matatu = matatus.find(m => m.id === p.matatu_id);
-                  return (
-                    <div key={p.id} className="bg-white border border-stone-200 rounded-xl p-5 flex justify-between items-center hover:border-amber-300 transition-all">
-                      <div>
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="text-xs bg-amber-100 text-amber-700 font-bold px-2 py-0.5 rounded">{p.payment_type}</span>
-                          {matatu && <span className="text-xs text-stone-400">🚐 {matatu.plate}</span>}
-                        </div>
-                        <p className="font-black text-stone-800 text-lg">KES {p.amount?.toLocaleString()}</p>
-                        <p className="text-stone-400 text-xs">{p.date}{p.notes&&` · ${p.notes}`}</p>
-                      </div>
-                      {p.proof_file && <a href={p.proof_file} target="_blank" rel="noreferrer" className="text-xs bg-stone-100 text-stone-600 border border-stone-200 px-3 py-1.5 rounded">📎 View Proof</a>}
-                    </div>
-                  );
-                })}
-                <div className="bg-stone-800 text-white rounded-xl p-4 flex justify-between">
-                  <span className="text-stone-300 text-sm">Total Paid to SACCO</span>
-                  <span className="font-black">KES {saccoPayments.reduce((s,p)=>s+(p.amount||0),0).toLocaleString()}</span>
-                </div>
-              </div>
-            )}
+           {saccoPayments.length === 0 ? (
+  <div className="bg-white border border-stone-200 rounded-xl p-8 text-center text-stone-400">No payments recorded yet</div>
+) : (
+  <div className="space-y-3">
+    {saccoPayments.map(p => {
+      const matatu = matatus.find(m => m.id === p.matatu_id);
+      return (
+        <div key={p.id} className="bg-white border border-stone-200 rounded-xl p-5 flex justify-between items-center hover:border-amber-300 transition-all">
+          <div>
+            <div className="flex items-center gap-2 mb-1 flex-wrap">
+              <span className="text-xs bg-amber-100 text-amber-700 font-bold px-2 py-0.5 rounded">{p.payment_type}</span>
+              {matatu && <span className="text-xs text-stone-400">🚐 {matatu.plate}</span>}
+              
+              {/* STATUS BADGE */}
+              <span className={`text-[10px] px-2.5 py-0.5 rounded-full font-black uppercase ${
+                p.status === "approved" ? "bg-green-100 text-green-700" :
+                p.status === "rejected" ? "bg-red-100 text-red-700" :
+                "bg-yellow-100 text-yellow-800"
+              }`}>
+                {p.status || "approved"}
+              </span>
+            </div>
+            <p className="font-black text-stone-800 text-lg">KES {p.amount?.toLocaleString()}</p>
+            <p className="text-stone-400 text-xs">{p.date}{p.notes&&` · ${p.notes}`}</p>
+          </div>
+          {p.proof_file && <a href={p.proof_file} target="_blank" rel="noreferrer" className="text-xs bg-stone-100 text-stone-600 border border-stone-200 px-3 py-1.5 rounded">📎 View Proof</a>}
+        </div>
+      );
+    })}
+    <div className="bg-stone-800 text-white rounded-xl p-4 flex justify-between">
+      <span className="text-stone-300 text-sm">Total Approved Paid to SACCO</span>
+      <span className="font-black">KES {totalSaccoPaid.toLocaleString()}</span>
+    </div>
+  </div>
+)}
           </div>
         )}
       </div>

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import API from "../api";
 import { useAuth } from "../context/AuthContext";
 import LoanDashboard from "../components/LoanDashboard";
+import Savings from "../components/Savings"; // <--- ADD THIS IMPORT
 
 const TABS = [
   { key: "home",          label: "🏠 Home" },
@@ -503,124 +504,7 @@ export default function DriverDashboard() {
         {/* ══════ SAVINGS ══════ */}
         {activeTab === "savings" && (
           <div>
-            <h2 className="text-2xl font-black mb-2">🏦 Savings</h2>
-            <p className="text-gray-400 text-sm mb-6">Personal savings belong to you only. Matatu savings are linked to {assignment?.plate} and visible to the owner.</p>
-
-            {/* Tab switcher */}
-            <div className="flex gap-2 mb-6">
-              <button onClick={() => setSavingTab("personal")}
-                className={`px-5 py-2.5 rounded-lg font-bold text-sm transition-all ${savingTab==="personal"?"bg-emerald-500 text-black":"bg-gray-800 text-gray-400 hover:text-white"}`}>
-                👤 Personal Savings
-              </button>
-              <button onClick={() => setSavingTab("matatu")}
-                className={`px-5 py-2.5 rounded-lg font-bold text-sm transition-all ${savingTab==="matatu"?"bg-blue-600 text-white":"bg-gray-800 text-gray-400 hover:text-white"}`}>
-                🚐 Matatu Savings ({assignment?.plate})
-              </button>
-            </div>
-
-            {savingTab === "personal" && (
-              <>
-                <div className="bg-gradient-to-br from-emerald-900 to-emerald-800 border border-emerald-700 rounded-xl p-6 mb-6">
-                  <p className="text-emerald-300 text-xs uppercase tracking-widest mb-1">Personal Balance</p>
-                  <p className="text-4xl font-black text-white">KES {personalSavings.balance?.toLocaleString()||0}</p>
-                  <p className="text-emerald-400 text-xs mt-2">Only visible to you</p>
-                </div>
-                <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
-                  <h3 className="font-bold text-emerald-400 mb-4 text-sm uppercase tracking-widest">Deposit to Personal Savings</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                    <div>
-                      <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Amount (KES)</label>
-                      <input type="number" placeholder="e.g. 1000" value={personalForm.amount}
-                        onChange={e => setPersonalForm({...personalForm,amount:e.target.value})}
-                        className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white placeholder-gray-600 focus:border-emerald-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Date</label>
-                      <input type="date" value={personalForm.date}
-                        onChange={e => setPersonalForm({...personalForm,date:e.target.value})}
-                        className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white focus:border-emerald-500 outline-none" />
-                    </div>
-                  </div>
-                  <div className="mb-4">
-                    <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Description</label>
-                    <input placeholder="e.g. Monthly savings" value={personalForm.description}
-                      onChange={e => setPersonalForm({...personalForm,description:e.target.value})}
-                      className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white placeholder-gray-600 focus:border-emerald-500 outline-none" />
-                  </div>
-                  <button onClick={depositPersonal} className="bg-emerald-500 text-black font-black px-6 py-3 rounded-lg hover:bg-emerald-400">💳 Deposit</button>
-                </div>
-                <h3 className="font-bold text-gray-400 mb-3 text-sm uppercase tracking-widest">Personal Transaction History</h3>
-                {(!personalSavings.transactions||personalSavings.transactions.length===0) ? (
-                  <p className="text-gray-600 text-sm">No personal transactions yet</p>
-                ) : (
-                  <div className="space-y-2">
-                    {personalSavings.transactions.map(t => (
-                      <div key={t.id} className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex justify-between items-center">
-                        <div>
-                          <p className="text-sm text-white">{t.description||"Deposit"}</p>
-                          <p className="text-xs text-gray-500">{t.date}</p>
-                        </div>
-                        <p className={`font-black ${t.transaction_type==="deposit"?"text-emerald-400":"text-red-400"}`}>
-                          {t.transaction_type==="deposit"?"+":"-"}KES {t.amount?.toLocaleString()}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-
-            {savingTab === "matatu" && (
-              <>
-                <div className="bg-gradient-to-br from-blue-900 to-blue-800 border border-blue-700 rounded-xl p-6 mb-6">
-                  <p className="text-blue-300 text-xs uppercase tracking-widest mb-1">Matatu Savings Balance — {assignment?.plate}</p>
-                  <p className="text-4xl font-black text-white">KES {matatuSavings.balance?.toLocaleString()||0}</p>
-                  <p className="text-blue-400 text-xs mt-2">Visible to owner and all matatu crew</p>
-                </div>
-                <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 mb-6">
-                  <h3 className="font-bold text-blue-400 mb-4 text-sm uppercase tracking-widest">Deposit to Matatu Savings</h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-                    <div>
-                      <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Amount (KES)</label>
-                      <input type="number" placeholder="e.g. 1000" value={matatuForm.amount}
-                        onChange={e => setMatatuForm({...matatuForm,amount:e.target.value})}
-                        className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white placeholder-gray-600 focus:border-blue-500 outline-none" />
-                    </div>
-                    <div>
-                      <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Date</label>
-                      <input type="date" value={matatuForm.date}
-                        onChange={e => setMatatuForm({...matatuForm,date:e.target.value})}
-                        className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white focus:border-blue-500 outline-none" />
-                    </div>
-                  </div>
-                  <div className="mb-4">
-                    <label className="text-xs text-gray-400 uppercase tracking-widest mb-1 block">Description</label>
-                    <input placeholder="e.g. Daily matatu savings" value={matatuForm.description}
-                      onChange={e => setMatatuForm({...matatuForm,description:e.target.value})}
-                      className="w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-white placeholder-gray-600 focus:border-blue-500 outline-none" />
-                  </div>
-                  <button onClick={depositMatatu} className="bg-blue-600 text-white font-black px-6 py-3 rounded-lg hover:bg-blue-500">💳 Deposit to Matatu</button>
-                </div>
-                <h3 className="font-bold text-gray-400 mb-3 text-sm uppercase tracking-widest">Matatu Savings History</h3>
-                {(!matatuSavings.transactions||matatuSavings.transactions.length===0) ? (
-                  <p className="text-gray-600 text-sm">No matatu savings yet</p>
-                ) : (
-                  <div className="space-y-2">
-                    {matatuSavings.transactions.map(t => (
-                      <div key={t.id} className="bg-gray-900 border border-gray-800 rounded-xl p-4 flex justify-between items-center">
-                        <div>
-                          <p className="text-sm text-white">{t.description||"Deposit"}</p>
-                          <p className="text-xs text-gray-500">{t.date}</p>
-                        </div>
-                        <p className={`font-black ${t.transaction_type==="deposit"?"text-blue-400":"text-red-400"}`}>
-                          {t.transaction_type==="deposit"?"+":"-"}KES {t.amount?.toLocaleString()}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
+            <Savings />
           </div>
         )}
 

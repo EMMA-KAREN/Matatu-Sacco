@@ -7,6 +7,7 @@ import Matatus from "./pages/Matatus";
 // import Loans from "./pages/Loans";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
+import DashboardRouter from "./pages/DashboardRouter";
 import Activate from "./pages/Activate";
 import HRDashboard from "../src/pages/HRDashboard"
 import MainLayout from "./layout/MainLayout";
@@ -14,7 +15,7 @@ import Members from "./components/Members";
 import StageOperator from "./pages/StageOperator";
 import OwnerDashboard from "./components/OwnerDashboard";
 import AdminDashboard from "./context/AdminDashboard";
-
+import SubStageOperator from "./pages/SubStageOperator";
 
 function OwnerDashboardWrapper() {
   const { user } = useAuth();
@@ -28,8 +29,7 @@ function App() {
    <AuthProvider>
      <BrowserRouter>
       <Routes>
-       
-         {/* <Route path="/dashboard" element={<DashboardRouter user={user} />} /> */}
+            <Route path="/dashboard" element={<DashboardRouter user={user} />} />
         <Route path="/matatus" element={<Matatus/>} />
         <Route path="/members" element={<Members />} />
         <Route path="/owner" element={<OwnerDashboard />} />
@@ -39,6 +39,7 @@ function App() {
         <Route path="/hr" element={<HRDashboard />} />
         <Route path="/" element={<MainLayout/>} />
         <Route path="/stage-operator" element={<StageOperator />} />
+        <Route path="/sub-stage-operator" element={<SubStageOperator />} /> 
         <Route path="/driver" element={<DriverDashboard />} />
         <Route path="/conductor" element={<DriverDashboard />} />   
          <Route path="/AdminDashboard" element={<AdminDashboard />} />   

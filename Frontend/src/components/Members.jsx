@@ -19,7 +19,7 @@ export default function Members() {
   const handleSubmit = async (e) => {
     e.preventDefault();
 
-    const res = await fetch("http://localhost:5000/members", {
+    const res = await fetch("https://saccoflow360.top/members", {
     
       method: "POST",
       headers: {
