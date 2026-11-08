@@ -279,73 +279,75 @@ export default function StageOperator() {
   };
 
   // ── SLIP PRINTING ──
-  const printReceipt = async (r) => {
-    let tripNumber = 1;
-    let isFirstTrip = true;
+ const printReceipt = async (r) => {
+  let tripNumber = 1;
+  let isFirstTrip = true;
+  const feePaid = parseFloat(r.shimo_fee || 0);
 
-    try {
-      const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(r.plate)}&date=${r.date_issued}`, { headers });
-      if (res.ok) {
-        const data = await res.json();
-        const count = data.trip_count || 1;
-        if (parseFloat(r.shimo_fee) >= 200 && count <= 1) {
-          isFirstTrip = true;
-          tripNumber = 1;
-        } else {
-          isFirstTrip = false;
-          tripNumber = count > 1 ? count : 2;
-        }
-      }
-    } catch {
-      isFirstTrip = parseFloat(r.shimo_fee) >= 200;
+  try {
+    const res = await fetch(
+      `${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(r.plate)}&date=${r.date_issued}`,
+      { headers }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const count = data.trip_count || 1;
+      isFirstTrip = count <= 1 && feePaid >= 150;
+      tripNumber = count;
     }
+  } catch {
+    isFirstTrip = feePaid >= 150;
+  }
 
-    const win = window.open("", "_blank");
-    win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
-      <style>
-        body{font-family:monospace;padding:20px;max-width:380px;margin:auto;}
-        h2{text-align:center;margin-bottom:2px;}
-        .meta{text-align:center;font-size:11px;color:#555;margin-bottom:12px;}
-        .line{display:flex;justify-content:space-between;margin:6px 0;border-bottom:1px dashed #ddd;padding-bottom:4px;font-size:13px;}
-        .ticket{text-align:center;font-size:18px;font-weight:bold;margin:14px 0;background:#f4f4f4;padding:6px;border-radius:4px;}
-        .highlight{font-weight:bold;color:#000;font-size:14px;}
-        .footer{text-align:center;margin-top:20px;font-size:11px;color:#666;}
-      </style></head>
-      <body>
-        <h2>${r.sacco_name || "2KM SACCO"}</h2>
-        <div class="meta">
-          ${r.location ? `<div>📍 ${r.location}</div>` : ""}
-          ${r.phone_number ? `<div>📞 Helpline: ${r.phone_number}</div>` : ""}
-        </div>
-        <div class="ticket">🎫 ${r.ticket_number}</div>
-        <div class="line"><span>Vehicle Plate:</span><span class="highlight">${r.plate}</span></div>
-        <div class="line"><span>Owner Member:</span><span>${r.owner_name || "N/A"}</span></div>
-        <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
+  const win = window.open("", "_blank");
+  win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
+  <style>
+    @page { size: 58mm auto; margin: 0; }
+    html, body { margin: 0; padding: 0; }
+    body { font-family: monospace; width: 48mm; padding: 1mm 2mm; font-size: 9px; line-height: 1.15; color: #000; }
+    h2 { font-size: 11px; text-align: center; margin: 0; }
+    .meta { text-align: center; font-size: 8px; margin: 0 0 2px; line-height: 1.1; }
+    .ticket { text-align: center; font-size: 10px; font-weight: bold; margin: 2px 0; padding: 1px 0; border: 1px solid #000; white-space: nowrap; }
+    .line { display: flex; justify-content: space-between; gap: 4px; margin: 1px 0; padding-bottom: 1px; border-bottom: 1px dashed #999; font-size: 9px; }
+    .line span:last-child { text-align: right; }
+    .highlight { font-weight: bold; }
+    .box { border-top: 1px solid #000; border-bottom: 1px solid #000; padding: 1px 0; font-weight: bold; }
+    .footer { text-align: center; margin-top: 3px; font-size: 8px; line-height: 1.1; }
+  </style></head>
+  <body>
+    <h2>${r.sacco_name || "2KM SACCO"}</h2>
+    <div class="meta">
+      ${r.location ? `${r.location}` : ""}${r.phone_number ? ` | Tel: ${r.phone_number}` : ""}
+    </div>
+    <div class="ticket">${r.ticket_number}</div>
+    <div class="line"><span>Plate:</span><span class="highlight">${r.plate}</span></div>
+    <div class="line"><span>Owner No:</span><span>${r.owner_name || "N/A"}</span></div>
+    <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
 
-        ${isFirstTrip ? `
-          <div class="line highlight" style="border-top:1px solid #000;border-bottom:1px solid #000;padding:6px 0;background:#f9f9f9;">
-            <span>Owner Savings Credited:</span><span>KES 50.00</span>
-          </div>
-        ` : `
-          <div class="line highlight" style="border-top:1px solid #000;border-bottom:1px solid #000;padding:6px 0;background:#f9f9f9;">
-            <span>Daily Trip Cleared:</span><span>Trip #${tripNumber}</span>
-          </div>
-        `}
+    ${isFirstTrip ? `
+      <div class="line box">
+        <span>Savings Credited (${r.owner_name || "N/A"}):</span>
+        <span class="highlight">KES 50.00</span>
+      </div>
+    ` : `
+      <div class="line box">
+        <span>Trip Cleared:</span>
+        <span class="highlight">#${tripNumber}</span>
+      </div>
+    `}
 
-        <div class="line"><span>Fee Paid:</span><span class="highlight">KES ${r.shimo_fee}</span></div>
-        <div class="line"><span>Date Issued:</span><span>${r.date_issued}</span></div>
-        <div class="line"><span>Time Issued:</span><span>${r.time_issued || ""}</span></div>
-        <div class="line"><span>Operator No:</span><span>${r.operator_membership_no || user?.membership_no || "N/A"}</span></div>
+    <div class="line"><span>${r.date_issued}</span><span>${r.time_issued || ""}</span></div>
+    <div class="line"><span>Operator:</span><span>${r.operator_membership_no || user?.membership_no || "N/A"}</span></div>
 
-        <div class="footer">
-          ${isFirstTrip 
-            ? `*** Official Matatu Owner Savings Slip ***<br/>Stage Clearance Verified` 
-            : `*** Stage Clearance Slip (Trip #${tripNumber}) ***<br/>Welfare Split Allocated`}
-        </div>
-      </body></html>`);
-    win.document.close();
-    setTimeout(() => win.print(), 500);
-  };
+    <div class="footer">
+      ${isFirstTrip
+        ? `*** Owner Savings Slip ***<br/>Stage Clearance Verified`
+        : `*** Stage Clearance Slip (Trip #${tripNumber}) ***<br/>Stage Clearance Verified`}
+    </div>
+  </body></html>`);
+  win.document.close();
+  setTimeout(() => win.print(), 500);
+};
 
   const fetchSummary = async () => {
     setSummaryLoading(true);

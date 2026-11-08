@@ -107,6 +107,43 @@ input, select, textarea {
     padding: 4px 10px !important;
     font-size: 11px !important;
   }
+    /* ── B2. HR ONLY: sidebar class .app-sidebar ── */
+  .app-sidebar {
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 40 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    min-height: 0 !important;
+    padding: 8px 12px !important;
+  }
+  .app-sidebar .sidebar-header { margin-bottom: 4px !important; }
+  .app-sidebar .sidebar-header > .h-px { display: none !important; }
+
+  .app-sidebar .sidebar-nav {
+    display: flex !important;
+    flex-direction: row !important;
+    flex: none !important;
+    overflow-x: auto !important;
+    white-space: nowrap !important;
+    gap: 6px !important;
+    padding: 4px 0 !important;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .app-sidebar .sidebar-nav::-webkit-scrollbar { display: none; }
+
+  .app-sidebar .sidebar-nav > button {
+    flex: 0 0 auto !important;
+    width: auto !important;
+    margin: 0 !important;
+    padding: 6px 12px !important;
+    font-size: 12px !important;
+    border-radius: 9999px !important;
+  }
+  .app-sidebar .sidebar-footer { display: none !important; }
+  
 
   /* ── C. MAIN CONTENT AREA: Full Width & Compact Padding ── */
   .flex-1.bg-slate-50,

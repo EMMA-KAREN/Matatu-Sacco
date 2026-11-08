@@ -857,7 +857,7 @@ export default function StageExpensesAndWelfare({ user }) {
                 </tbody>
               </table>
             </div>
-          </div>
+          </div>c
         </div>
       )}
     </div>

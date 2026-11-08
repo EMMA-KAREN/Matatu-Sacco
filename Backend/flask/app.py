@@ -1,10 +1,10 @@
 import os
-import re 
+import re
 import json
 import cloudinary
 from dotenv import load_dotenv
 # 1. Load the .env file and force override any existing system shell variables
-load_dotenv(override=True) 
+load_dotenv(override=True)
 import cloudinary.uploader
 import africastalking
 import requests
@@ -12,11 +12,13 @@ import base64
 import random
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from models import db, Matatu, Document, Ticket, Progress, Member, Payment, Route,Notification,LoanLedgerEntry, Receipt, Assignment, DailyEarning, Expenditure, Saving, LoanRequest, LoanRepayment, SaccoPayment, LoanType, LoanApplication, LoanGuarantor, LoanRepaymentSchedule, LoanPayment, LoanAuditLog,LoanRepaymentAccount,RepaymentAccountTransaction,AuditLogPermanent,SalaryConfig,SalaryPayment,WorkerWarning,SaccoSetting,StageExpense,PenaltyLog,WelfareLedger,CasualPayment
+from models import db, Matatu, Document, Ticket, Progress, Member, Payment, Route, Notification, LoanLedgerEntry, Receipt, Assignment, DailyEarning, Expenditure, Saving, LoanRequest, LoanRepayment, SaccoPayment, LoanType, LoanApplication, LoanGuarantor, LoanRepaymentSchedule, LoanPayment, LoanAuditLog, LoanRepaymentAccount, RepaymentAccountTransaction, AuditLogPermanent, SalaryConfig, SalaryPayment, WorkerWarning, SaccoSetting, StageExpense, PenaltyLog, WelfareLedger, CasualPayment
 from config import Config
 from flask_migrate import Migrate
 from datetime import datetime, timedelta
 from flask_migrate import upgrade
+from werkzeug.exceptions import HTTPException
+
 from sqlalchemy.exc import IntegrityError
 from flask_jwt_extended import (
     JWTManager,
@@ -26,6 +28,17 @@ from flask_jwt_extended import (
 )
 
 app = Flask(__name__, static_folder="build", static_url_path="/")
+
+
+@app.errorhandler(Exception)
+def handle_exc(e):
+    db.session.rollback()
+    if isinstance(e, HTTPException):
+        return e
+    print("ERROR:", repr(e))
+    return jsonify(error="Server error", detail=str(e)), 500
+
+
 app.config.from_object(Config)
 jwt = JWTManager(app)
 app.config['JWT_SECRET_KEY'] = 'your-super-secret-key'
@@ -37,14 +50,16 @@ app.config["JWT_HEADER_TYPE"] = "Bearer"
 
 
 db.init_app(app)
-CORS(
-    app,
-    supports_credentials=True,
-    resources={r"/*": {"origins": "*"}},
-    allow_headers=["Content-Type", "Authorization"]
-)
+CORS(app,
+     resources={r"/*": {"origins": ["https://saccoflow360.top", "https://www.saccoflow360.top", "http://localhost:5173", "http://localhost:3000"]}},
+     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 
 migrate = Migrate(app, db)
+
+# in-memory store used by the legacy /hr/audit-log routes
+audit_logs = []
 
 # ---------------- CLOUDINARY ----------------
 # 1. Force remove the hidden system variable overriding your config
@@ -72,6 +87,71 @@ except Exception as e:
     sms = None
 
 
+# ================= SHARED HELPERS =================
+def upload_any(file):
+    """Upload an image or raw file (pdf/doc) to Cloudinary and return its secure URL."""
+    ft = file.content_type or ""
+    up = cloudinary.uploader.upload(file, resource_type="image" if "image" in ft else "raw")
+    return up["secure_url"]
+
+
+def notify_roles(roles, title, message, sender="SACCO System"):
+    """In-app notification to every active member whose role is in `roles`."""
+    for m in Member.query.filter(db.func.lower(Member.role).in_(roles), Member.is_active == True).all():
+        db.session.add(Notification(recipient_id=m.id, sender_name=sender, type="loan",
+                                    title=title, message=message))
+
+
+def generate_schedule(loan):
+    """Create the repayment schedule for a loan according to its loan type rules."""
+    loan_type = LoanType.query.get(loan.loan_type_id)
+    freq = getattr(loan_type, "repayment_frequency", "monthly") or "monthly"
+    start_rule = getattr(loan_type, "repayment_start_rule", "next_period") or "next_period"
+    start_date = datetime.utcnow()
+    for i in range(1, loan.repayment_months + 1):
+        step = i - 1 if start_rule == "same_day" else i
+        if freq == "daily":
+            due = start_date + timedelta(days=step)
+        elif freq == "weekly":
+            due = start_date + timedelta(weeks=step)
+        else:
+            try:
+                from dateutil.relativedelta import relativedelta
+                due = start_date + relativedelta(months=step)
+            except ImportError:
+                due = start_date + timedelta(days=step * 30)
+        db.session.add(LoanRepaymentSchedule(
+            loan_id=loan.id, installment_no=i,
+            due_date=due.strftime("%Y-%m-%d"), amount_due=loan.monthly_installment))
+
+
+def loan_extras(l):
+    """Security (logbook) + pre-cheque requirements fields for loan JSON responses."""
+    return {
+        "security_status": getattr(l, "security_status", "none") or "none",
+        "security_logbook": getattr(l, "security_logbook", None),
+        "security_logbook_no": getattr(l, "security_logbook_no", None),
+        "security_notes": getattr(l, "security_notes", None),
+        "requirements_status": getattr(l, "requirements_status", "none") or "none",
+        "requirements_notes": getattr(l, "requirements_notes", None),
+        "loan_form_file": getattr(l, "loan_form_file", None),
+        "insurance_file": getattr(l, "insurance_file", None),
+        "insurance_amount": getattr(l, "insurance_amount", 0) or 0,
+        "insurance_ref": getattr(l, "insurance_ref", None),
+        "bank_charges_amount": getattr(l, "bank_charges_amount", 0) or 0,
+        "bank_charges_ref": getattr(l, "bank_charges_ref", None),
+        "bank_charges_method": getattr(l, "bank_charges_method", None),
+        "cheque_no": getattr(l, "cheque_no", None),
+        "cheque_date": getattr(l, "cheque_date", None),
+    }
+
+
+def release_security_if_cleared(loan):
+    """When a loan is cleared the logbook held as additional security is released."""
+    if loan.status == "cleared" and (getattr(loan, "security_status", "none") or "none") in ("held", "pending_approval", "required"):
+        loan.security_status = "released"
+
+
 # ================= MPESA =================
 def get_mpesa_token():
     url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
@@ -81,13 +161,11 @@ def get_mpesa_token():
     except:
         return ""
 
-    
-@app.route("/", defaults={"path": ""})
-@app.route("/<path:path>")
-def serve_react(path):
-    if path != "" and os.path.exists(app.static_folder + "/" + path):
-        return send_from_directory(app.static_folder, path)
-    return send_from_directory(app.static_folder, "index.html")
+
+@app.route('/')
+def home():
+    return {"status": "success", "message": "Saccoflow API is running!"}, 200
+
 
 # Add this temporary route to your main file
 @app.route('/create-the-db-tables-992')
@@ -97,6 +175,8 @@ def init_db():
         return "Database tables created successfully!"
     except Exception as e:
         return f"An error occurred: {str(e)}"
+
+
 # Add this temporary route to your main file
 @app.route('/run-my-migrations-992')
 def run_migrations():
@@ -105,7 +185,8 @@ def run_migrations():
         return "Migrations run successfully!"
     except Exception as e:
         return f"An error occurred: {str(e)}"
-    
+
+
 @app.route("/mpesa/pay", methods=["POST"])
 def mpesa_pay():
     data = request.json
@@ -133,7 +214,8 @@ def mpesa_pay():
         return jsonify(res.json())
     except Exception as e:
         return jsonify({"error": str(e), "ResponseCode": "1"}), 500
- 
+
+
 @app.route("/mpesa/callback", methods=["POST"])
 def mpesa_callback():
     data = request.json
@@ -148,33 +230,48 @@ def mpesa_callback():
         print("Callback error:", e)
     return jsonify({"ResultCode": 0})
 
-# ================= INIT & AUTO-MIGRATIONS =================
+
 # ================= INIT & AUTO-MIGRATIONS =================
 with app.app_context():
     upload_folder = app.config.get("UPLOAD_FOLDER", "uploads")
     os.makedirs(upload_folder, exist_ok=True)
 
-    # 1. Add pending_edit to loan_application table
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(db.text("ALTER TABLE loan_application ADD COLUMN pending_edit TEXT"))
-            conn.commit()
-            print("✓ Successfully added 'pending_edit' column to loan_application table!")
-    except Exception as e:
-        pass  # Column already exists
+    MIGRATIONS = [
+        "ALTER TABLE loan_application ADD COLUMN pending_edit TEXT",
+        "ALTER TABLE member ADD COLUMN is_rejected BOOLEAN DEFAULT FALSE",
+        # Logbook security
+        "ALTER TABLE loan_application ADD COLUMN security_logbook TEXT",
+        "ALTER TABLE loan_application ADD COLUMN security_logbook_no VARCHAR(50)",
+        "ALTER TABLE loan_application ADD COLUMN security_status VARCHAR(30) DEFAULT 'none'",
+        "ALTER TABLE loan_application ADD COLUMN security_notes TEXT",
+        # Post-approval requirements: Form, Insurance, Bank charges & Cheque
+       "ALTER TABLE loan_application ADD COLUMN loan_form_file TEXT",
+        "ALTER TABLE loan_application ADD COLUMN insurance_file TEXT",
+        "ALTER TABLE loan_application ADD COLUMN insurance_amount FLOAT DEFAULT 0",
+        "ALTER TABLE loan_application ADD COLUMN insurance_ref VARCHAR(60)",
+        "ALTER TABLE loan_application ADD COLUMN bank_charges_amount FLOAT DEFAULT 0",
+        "ALTER TABLE loan_application ADD COLUMN bank_charges_ref VARCHAR(60)",
+        "ALTER TABLE loan_application ADD COLUMN bank_charges_method VARCHAR(20)",
+        "ALTER TABLE loan_application ADD COLUMN bank_charges_file TEXT",
+        "ALTER TABLE loan_application ADD COLUMN cheque_no VARCHAR(60)",
+        "ALTER TABLE loan_application ADD COLUMN cheque_date VARCHAR(30)",
+        "ALTER TABLE loan_application ADD COLUMN requirements_status VARCHAR(30) DEFAULT 'none'",
+        "ALTER TABLE loan_application ADD COLUMN requirements_notes TEXT",
+    ]
+    
+    for stmt in MIGRATIONS:
+        try:
+            with db.engine.begin() as conn:
+                conn.execute(db.text(stmt))
+        except Exception:
+            pass  # column already exists
+    print("✓ Database initialization check completed.")
 
-    # 2. Add is_rejected to member table
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(db.text("ALTER TABLE member ADD COLUMN is_rejected BOOLEAN DEFAULT 0"))
-            conn.commit()
-    except Exception:
-        pass
+
 # ================= FILES =================
 @app.route("/uploads/<filename>")
 def uploaded_file(filename):
     return send_from_directory(app.config.get("UPLOAD_FOLDER", "uploads"), filename)
-
 
 
 # ================= PASSWORD RECOVERY & ADMIN OVERRIDE =================
@@ -246,6 +343,8 @@ def admin_reset_member_password(id):
     db.session.commit()
 
     return jsonify({"message": f"Password for {member.name} successfully updated!"}), 200
+
+
 # ── 1. UNIFIED EDIT (HR Proposes -> Staged; Admin Edits -> Applies & Notifies HR) ──
 @app.route("/loan-applications/<int:id>/edit", methods=["PUT"])
 @jwt_required()
@@ -270,8 +369,7 @@ def edit_loan_application(id):
 
     member = Member.query.get(loan.member_id)
 
-    # ── CASE A: HR PROPOSES (Pending Admin Approval) ──
-   # ── CASE A: HR EDITS (Staged for Admin Approval) ──
+    # ── CASE A: HR EDITS (Staged for Admin Approval) ──
     if user_role == "hr":
         proposal = {
             "proposed_by_id": identity["id"],
@@ -294,14 +392,7 @@ def edit_loan_application(id):
         loan.pending_edit = json.dumps(proposal)
         db.session.commit()
 
-        # Case-insensitive query ensuring all active admins/directors receive notification
-        admins = Member.query.filter(
-            db.func.lower(db.func.trim(Member.role)).in_(["admin", "director"]),
-            Member.is_active != False
-        ).all()
-
-        # Fallback if roles were customized (e.g. 'superadmin')
-       # Locate all active admins or directors
+        # Locate all admins or directors
         admins = Member.query.filter(
             db.or_(
                 db.func.lower(Member.role).like("%admin%"),
@@ -321,8 +412,6 @@ def edit_loan_application(id):
                 is_read=False,
                 created_at=datetime.utcnow()  # Explicit timestamp
             ))
-
-     
 
             # Optional: SMS dispatch to Admin
             if a.phone and sms:
@@ -355,7 +444,6 @@ def edit_loan_application(id):
     else:
         old_amount = loan.amount
         old_rate = loan.interest_rate
-        old_months = loan.repayment_months
 
         loan.amount = new_amount
         loan.interest_rate = new_interest
@@ -409,6 +497,7 @@ def edit_loan_application(id):
                 "purpose": loan.purpose
             }
         }), 200
+
 
 # ── 2. ADMIN APPROVES HR'S PROPOSAL ──
 @app.route("/loan-applications/<int:id>/approve-edit", methods=["PUT"])
@@ -516,6 +605,7 @@ def reject_loan_edit(id):
 
     return jsonify({"message": "Proposed loan edits rejected."}), 200
 
+
 # ================= MATATUS =================
 @app.route("/matatus", methods=["GET"])
 def get_matatus():
@@ -566,7 +656,7 @@ def create_matatu():
     print("OWNER FOUND:", owner)
     if not owner:
         return jsonify({"error": "Invalid owner selected"}), 400
-    
+
     # 👇 Check duplicate plate BEFORE inserting
     existing = Matatu.query.filter_by(plate=request.form.get("plate")).first()
     if existing:
@@ -598,13 +688,13 @@ def create_matatu():
         file_url = None
 
         if file:
-        # ✅ After - handles both images and raw files (PDF, docx, etc)
-           file_type = file.content_type or ""
-           if "image" in file_type:
-              upload = cloudinary.uploader.upload(file)
-           else:
-              upload = cloudinary.uploader.upload(file, resource_type="raw")
-           file_url = upload["secure_url"]
+            # handles both images and raw files (PDF, docx, etc)
+            file_type = file.content_type or ""
+            if "image" in file_type:
+                upload = cloudinary.uploader.upload(file)
+            else:
+                upload = cloudinary.uploader.upload(file, resource_type="raw")
+            file_url = upload["secure_url"]
 
         doc = Document(
             number=request.form.get(f"documents[{i}][number]"),
@@ -646,16 +736,15 @@ def update_matatu(id):
         file_url = request.form.get(f"documents[{i}][existing_file]")  # existing cloudinary URL
 
         if file:
-               
-                # ✅ After - handles both images and raw files (PDF, docx, etc)
-                file_type = file.content_type or ""
+            # handles both images and raw files (PDF, docx, etc)
+            file_type = file.content_type or ""
 
-                if "image" in file_type:
-                    upload = cloudinary.uploader.upload(file)
-                else:
-                    upload = cloudinary.uploader.upload(file, resource_type="raw")
+            if "image" in file_type:
+                upload = cloudinary.uploader.upload(file)
+            else:
+                upload = cloudinary.uploader.upload(file, resource_type="raw")
 
-                file_url = upload["secure_url"]
+            file_url = upload["secure_url"]
 
         doc = Document(
             number=request.form.get(f"documents[{i}][number]"),
@@ -672,23 +761,13 @@ def update_matatu(id):
     db.session.commit()
 
     return jsonify({"message": "Updated"})
+
+
 @app.route("/matatus/<int:id>", methods=["DELETE"])
 @jwt_required()
 def delete_matatu(id):
     matatu = Matatu.query.get_or_404(id)
-    
-    from models import (
-        Receipt, 
-        DailyEarning, 
-        Expenditure, 
-        Saving, 
-        SaccoPayment, 
-        LoanApplication, 
-        Assignment, 
-        Document, 
-        Progress
-    )
-    
+
     try:
         # 1. Retrieve or create a global 'RETIRED' vehicle profile to hold historical records
         retired_matatu = Matatu.query.filter_by(plate="RETIRED").first()
@@ -712,23 +791,24 @@ def delete_matatu(id):
         Saving.query.filter_by(matatu_id=id).update({Saving.matatu_id: target_id})
         SaccoPayment.query.filter_by(matatu_id=id).update({SaccoPayment.matatu_id: target_id})
         LoanApplication.query.filter_by(matatu_id=id).update({LoanApplication.matatu_id: target_id})
-        
+
         db.session.flush()
 
         # 3. Cascade delete temporary/non-audited Matatu files
         Document.query.filter_by(matatu_id=id).delete()
         Progress.query.filter_by(matatu_id=id).delete()
         Assignment.query.filter_by(matatu_id=id).delete()
-        
+
         # 4. Safely delete the selected Matatu row
         db.session.delete(matatu)
         db.session.commit()
-        
+
         return jsonify({"message": "Matatu retired successfully. Historical transaction data preserved under RETIRED status ✓"})
-        
+
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Failed to retire matatu: {str(e)}"}), 500
+
 
 # ================= TICKETS =================
 @app.route("/tickets", methods=["POST"])
@@ -827,6 +907,7 @@ def check_expiry():
 
     return jsonify({"message": "Expiry check complete"})
 
+
 # ================= MEMBERS =================
 @app.route("/members/<int:id>")
 def get_member(id):
@@ -840,8 +921,8 @@ def get_member(id):
         "membership_no": member.membership_no
     })
 
+
 # Get members
-# ================= MEMBERS =================
 @app.route("/hr/members")
 def get_members():
     members = Member.query.filter_by(is_active=True).all()
@@ -852,12 +933,13 @@ def get_members():
             "id": m.id,
             "name": m.name,
             "membership_no": m.membership_no,
-            "national_id": m.national_id,  # ✅ ADD THIS LINE
+            "national_id": m.national_id,
             "phone": m.phone,
             "role": m.role,
             "is_active": m.is_active
         } for m in members
     ])
+
 
 # sign up
 @app.route("/signup", methods=["POST"])
@@ -871,7 +953,7 @@ def signup():
         "driver",
         "conductor",
         "stage_operator",
-       "sub_stage_operator",  
+        "sub_stage_operator",
         "hr",
         "director",
         "member"
@@ -942,6 +1024,7 @@ def activate_account():
 
     return jsonify({"message": "Account activated successfully"})
 
+
 # Login
 @app.route("/login", methods=["POST"])
 def login():
@@ -962,12 +1045,12 @@ def login():
     if not member.is_active:
         return jsonify({"error": "Await HR approval"}), 403
 
-      # ── CHECK SUSPENSION ──
+    # ── CHECK SUSPENSION ──
     if getattr(member, "is_suspended", False):
         return jsonify({
             "error": "Your account has been suspended due to disciplinary actions. Please contact HR or Admin to lift your suspension."
         }), 403
-    
+
     print("PASSWORD CHECK:", member.check_password(data["password"]))
 
     if not member.check_password(data["password"]):
@@ -989,6 +1072,8 @@ def login():
             "membership_no": member.membership_no
         }
     })
+
+
 # HR CREATE MEMBER (NO APPROVAL NEEDED)
 @app.route("/hr/create-member", methods=["POST"])
 def hr_create_member():
@@ -1020,7 +1105,6 @@ def hr_create_member():
     db.session.add(member)
     db.session.commit()
 
-    # 🔴 RETURN MEMBER ID HERE
     return jsonify({
         "message": "Member created and activated",
         "id": member.id,
@@ -1030,6 +1114,8 @@ def hr_create_member():
             "name": member.name
         }
     }), 201
+
+
 # pending members (hr side)
 @app.route("/hr/pending-members", methods=["GET"])
 def pending_members():
@@ -1068,7 +1154,9 @@ def get_member_details(id):
         "role": m.role,
         "is_active": m.is_active
     })
-# UPDATE MEMBER (NO ROLE CHANGE, NO DELETE)
+
+
+# UPDATE MEMBER
 @app.route("/hr/member/update/<int:id>", methods=["PUT"])
 def update_member(id):
     m = Member.query.get_or_404(id)
@@ -1079,6 +1167,7 @@ def update_member(id):
         "driver",
         "conductor",
         "stage_operator",
+        "sub_stage_operator",
         "hr",
         "director",
         "member"
@@ -1097,7 +1186,8 @@ def update_member(id):
 
     return jsonify({"message": "Member updated"})
 
-# update role update
+
+# update role
 @app.route("/hr/update-role/<int:id>", methods=["PUT"])
 def update_role(id):
     m = Member.query.get_or_404(id)
@@ -1108,6 +1198,7 @@ def update_role(id):
         "driver",
         "conductor",
         "stage_operator",
+        "sub_stage_operator",
         "hr",
         "director",
         "member"
@@ -1121,8 +1212,8 @@ def update_role(id):
 
     return jsonify({"message": "Role updated"})
 
-# APPROVE MEMBER
 
+# APPROVE MEMBER
 @app.route("/hr/approve/<int:id>", methods=["PUT"])
 def approve_member(id):
     m = Member.query.get_or_404(id)
@@ -1130,7 +1221,8 @@ def approve_member(id):
     m.is_rejected = False
     db.session.commit()
     return jsonify({"message": f"Member {m.name} approved successfully"}), 200
-# REJECT MEMBER
+
+
 # ── REJECT & DELETE MEMBER (Handles members with login activity & foreign keys) ──
 @app.route("/hr/reject/<int:id>", methods=["DELETE"])
 def reject_member(id):
@@ -1171,6 +1263,7 @@ def reject_member(id):
 def get_logs():
     return jsonify(audit_logs)
 
+
 @app.route("/hr/audit-log", methods=["POST"])
 def add_log():
     data = request.get_json()
@@ -1182,6 +1275,8 @@ def add_log():
         "timestamp": data.get("timestamp")
     })
     return jsonify({"message": "logged"})
+
+
 @app.route("/audit/permanent", methods=["POST"])
 @jwt_required()
 def create_permanent_audit():
@@ -1200,6 +1295,7 @@ def create_permanent_audit():
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Logged", "id": log.id}), 201
+
 
 @app.route("/audit/permanent", methods=["GET"])
 @jwt_required()
@@ -1222,8 +1318,7 @@ def get_permanent_audit():
     } for l in logs])
 
 
-
-# # ================= OWNERS =================
+# ================= OWNERS =================
 @app.route("/owners", methods=["GET"])
 def get_owners():
     owners = Member.query.filter_by(role="owner", is_active=True).all()
@@ -1232,11 +1327,12 @@ def get_owners():
         {
             "id": owner.id,
             "name": owner.name,
-           "membership_no": owner.membership_no,
+            "membership_no": owner.membership_no,
             "phone": owner.phone
         }
         for owner in owners
     ])
+
 
 # ================= ROUTES =================
 @app.route("/routes", methods=["GET"])
@@ -1257,14 +1353,17 @@ def get_routes():
 @app.route("/routes", methods=["POST"])
 @jwt_required()
 def create_route():
-    data = request.get_json()
-    if not data or not data.get("from_stage") or not data.get("to_stage") or not data.get("shimo_fee"):
+    data = request.get_json(silent=True)  # <-- Use silent=True to prevent crashes
+    if not data:
+        return jsonify({"error": "Invalid or missing JSON body"}), 400
+
+    if not data.get("from_stage") or not data.get("to_stage") or not data.get("shimo_fee"):
         return jsonify({"error": "All fields required: from_stage, to_stage, shimo_fee"}), 400
 
     existing = Route.query.filter_by(
         from_stage=data["from_stage"].strip(), to_stage=data["to_stage"].strip()
     ).first()
-    
+
     subsequent_fee = float(data.get("subsequent_fee") or 100.0)
 
     if existing and existing.is_active:
@@ -1285,13 +1384,14 @@ def create_route():
     db.session.add(route)
     db.session.commit()
     return jsonify({
-        "message": "Route created", 
+        "message": "Route created",
         "id": route.id,
-        "from_stage": route.from_stage, 
+        "from_stage": route.from_stage,
         "to_stage": route.to_stage,
         "shimo_fee": route.shimo_fee,
         "subsequent_fee": route.subsequent_fee
     }), 201
+
 
 @app.route("/routes/<int:id>", methods=["PUT"])
 @jwt_required()
@@ -1310,13 +1410,14 @@ def update_route(id):
         route.subsequent_fee = float(data["subsequent_fee"])
     db.session.commit()
     return jsonify({
-        "message": "Route updated", 
+        "message": "Route updated",
         "id": route.id,
-        "from_stage": route.from_stage, 
+        "from_stage": route.from_stage,
         "to_stage": route.to_stage,
         "shimo_fee": route.shimo_fee,
         "subsequent_fee": route.subsequent_fee
     })
+
 
 @app.route("/routes/<int:id>", methods=["DELETE"])
 @jwt_required()
@@ -1326,12 +1427,13 @@ def delete_route(id):
     db.session.commit()
     return jsonify({"message": "Route deactivated"})
 
+
 @app.route("/me")
 @jwt_required()
 def get_me():
     return jsonify(get_jwt_identity())
 
-# ================= RECEIPTS =================
+
 # ================= SACCO SETTING HELPERS & ROUTES =================
 def get_or_create_sacco_setting():
     setting = SaccoSetting.query.get(1)
@@ -1340,6 +1442,7 @@ def get_or_create_sacco_setting():
         db.session.add(setting)
         db.session.commit()
     return setting
+
 
 @app.route("/settings/sacco", methods=["GET"])
 @jwt_required()
@@ -1352,6 +1455,7 @@ def get_sacco_setting():
         "phone_number": setting.phone_number
     })
 
+
 @app.route("/settings/sacco", methods=["PUT"])
 @jwt_required()
 def update_sacco_setting():
@@ -1359,10 +1463,10 @@ def update_sacco_setting():
     # Restrict write permissions to managers (HR, Admin, Director)
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized permission level"}), 403
-        
+
     data = request.get_json()
     setting = get_or_create_sacco_setting()
-    
+
     if "sacco_name" in data:
         setting.sacco_name = data["sacco_name"].strip()
     if "location" in data:
@@ -1371,22 +1475,32 @@ def update_sacco_setting():
         setting.po_box = data["po_box"].strip()
     if "phone_number" in data:
         setting.phone_number = data["phone_number"].strip()
-        
+
     db.session.commit()
     return jsonify({"message": "Sacco settings updated successfully"})
+
+
+# ================= RECEIPTS =================
+SUB_STAGE_FEES = (50.0, 100.0)
+
 
 def generate_ticket_number():
     date_str = datetime.now().strftime("%Y%m%d")
     random_num = random.randint(1000, 9999)
     return f"TKT-{date_str}-{random_num}"
 
+# In create_receipt:
 @app.route("/receipts", methods=["POST"])
 @jwt_required()
 def create_receipt():
     data = request.get_json()
+    fee = float(data.get("shimo_fee") or 0)
+    if fee <= 0:
+        return jsonify({"error": "Fee must be greater than 0"}), 400
+
     ticket_number = generate_ticket_number()
     setting = get_or_create_sacco_setting()
-    
+
     receipt = Receipt(
         ticket_number=ticket_number,
         sacco_name=setting.sacco_name,
@@ -1394,12 +1508,12 @@ def create_receipt():
         po_box=setting.po_box,
         phone_number=setting.phone_number,
         matatu_id=int(data["matatu_id"]),
-        plate=data["plate"].strip().upper(),  # <-- Normalize plate to uppercase
+        plate=data["plate"].strip().upper(),
         owner_name=data.get("owner_name", ""),
         route_id=int(data["route_id"]),
         from_stage=data["from_stage"],
         to_stage=data["to_stage"],
-        shimo_fee=float(data["shimo_fee"]),
+        shimo_fee=fee,
         capacity=data.get("capacity", 0),
         mode_of_payment=data["mode_of_payment"],
         issued_by=int(data["issued_by"]),
@@ -1411,7 +1525,7 @@ def create_receipt():
     db.session.add(receipt)
     db.session.commit()
     return jsonify({"message": "Draft created", "id": receipt.id, "ticket_number": ticket_number}), 201
-
+# In update_receipt:
 @app.route("/receipts/<int:id>", methods=["PUT"])
 @jwt_required()
 def update_receipt(id):
@@ -1419,19 +1533,24 @@ def update_receipt(id):
     if receipt.is_submitted:
         return jsonify({"error": "Submitted receipts cannot be edited"}), 403
     data = request.get_json()
+
+    if data.get("shimo_fee") is not None:
+        new_fee = float(data["shimo_fee"])
+        if new_fee <= 0:
+            return jsonify({"error": "Fee must be greater than 0"}), 400
+        receipt.shimo_fee = new_fee
+
     receipt.plate = data.get("plate", receipt.plate)
     receipt.owner_name = data.get("owner_name", receipt.owner_name)
     receipt.route_id = data.get("route_id", receipt.route_id)
     receipt.from_stage = data.get("from_stage", receipt.from_stage)
     receipt.to_stage = data.get("to_stage", receipt.to_stage)
-    if data.get("shimo_fee") is not None:
-        receipt.shimo_fee = float(data["shimo_fee"])
     receipt.capacity = data.get("capacity", receipt.capacity)
     receipt.mode_of_payment = data.get("mode_of_payment", receipt.mode_of_payment)
     receipt.date_issued = data.get("date_issued", receipt.date_issued)
     db.session.commit()
     return jsonify({"message": "Updated"})
- 
+
 # ================= STAGE SPLITS, SUB-STAGE & ADMIN AUDIT DESK =================
 @app.route("/receipts/<int:id>/submit", methods=["PUT"])
 @jwt_required()
@@ -1441,9 +1560,22 @@ def submit_receipt(id):
         return jsonify({"error": "Already submitted"}), 400
 
     receipt.is_submitted = True
-
-    # Check prior submitted trips with normalized plate
     clean_plate = (receipt.plate or "").strip().upper()
+
+    # ── SUB STAGE OPERATOR: full fee goes 100% to Sub-Branch Welfare ──
+    issuer = Member.query.get(receipt.issued_by)
+    if issuer and issuer.role == "sub_stage_operator":
+        db.session.add(WelfareLedger(
+            type="Inflow",
+            recipient_or_source=f"Sub-Branch Fee ({clean_plate})",
+            amount=float(receipt.shimo_fee),
+            reason=f"Sub-branch collection — Ticket {receipt.ticket_number}",
+            date=receipt.date_issued
+        ))
+        db.session.commit()
+        return jsonify({"message": f"Receipt submitted; KES {receipt.shimo_fee:,.0f} credited to Sub-Branch Welfare ✓"})
+
+    # ── MAIN STAGE ──
     prior_trips = Receipt.query.filter(
         db.func.upper(db.func.trim(Receipt.plate)) == clean_plate,
         Receipt.date_issued == receipt.date_issued,
@@ -1451,8 +1583,14 @@ def submit_receipt(id):
         Receipt.id != receipt.id
     ).count()
 
-    if prior_trips == 0 and receipt.shimo_fee >= 200:
-        # ── 1ST TRIP BREAKDOWN ──
+    total_fee = float(receipt.shimo_fee)
+
+    if prior_trips == 0 and total_fee >= 150:
+        # ── 1ST TRIP BREAKDOWN: KES 50 Savings, KES 100 Police, Remaining to Welfare ──
+        savings_cut = 50.0
+        police_cut = 100.0
+        remaining_welfare = max(0.0, total_fee - (savings_cut + police_cut))
+
         matatu = Matatu.query.filter(db.func.upper(db.func.trim(Matatu.plate)) == clean_plate).first()
         owner = Member.query.filter_by(membership_no=matatu.owner_member_no).first() if matatu else None
 
@@ -1460,29 +1598,37 @@ def submit_receipt(id):
             owner_saving = Saving(
                 member_id=owner.id,
                 matatu_id=matatu.id if matatu else None,
-                amount=50.0,
+                amount=savings_cut,
                 transaction_type="deposit",
                 description=f"First Trip Stage Savings — {clean_plate} ({receipt.ticket_number})",
-                date=receipt.date_issued
+                date=receipt.date_issued,
+                status="approved"
             )
             db.session.add(owner_saving)
 
-        welfare_entry = WelfareLedger(
-            type="Inflow",
-            recipient_or_source=f"Main Stage Split — {clean_plate}",
-            amount=50.0,
-            reason=f"Stage Welfare allocation from Ticket {receipt.ticket_number}",
-            date=receipt.date_issued
-        )
-        db.session.add(welfare_entry)
+        # Remaining balance allocated to Welfare
+        if remaining_welfare > 0:
+            welfare_entry = WelfareLedger(
+                type="Inflow",
+                recipient_or_source=f"Main Stage Split — {clean_plate}",
+                amount=remaining_welfare,
+                reason=f"First Trip remaining balance from Ticket {receipt.ticket_number}",
+                date=receipt.date_issued
+            )
+            db.session.add(welfare_entry)
 
+        # Police expense
         police_expense = StageExpense(
             matatu_plate=clean_plate,
             type="Police Fee",
-            amount=100.0,
+            amount=police_cut,
             source_account="Main Stage Collection",
-            description=f"Police allocation (100 KES) from Ticket {receipt.ticket_number}",
-            split_breakdown={"police_fee": 100.0, "welfare_pool": 50.0, "owner_savings": 50.0},
+            description=f"Police allocation (KES 100) from Ticket {receipt.ticket_number}",
+            split_breakdown={
+                "police_fee": police_cut,
+                "welfare_pool": remaining_welfare,
+                "owner_savings": savings_cut
+            },
             date=receipt.date_issued,
             is_submitted=True,
             recorded_by=receipt.issued_by
@@ -1493,8 +1639,8 @@ def submit_receipt(id):
         trip_num = prior_trips + 1
         welfare_subsequent_entry = WelfareLedger(
             type="Inflow",
-            recipient_or_source=f"Main Stage trip number {trip_num} — {clean_plate}",
-            amount=float(receipt.shimo_fee),
+            recipient_or_source=f"Main Stage trip #{trip_num} — {clean_plate}",
+            amount=total_fee,
             reason=f"Stage Welfare allocation from Ticket {receipt.ticket_number}",
             date=receipt.date_issued
         )
@@ -1503,13 +1649,17 @@ def submit_receipt(id):
     db.session.commit()
     return jsonify({"message": "Receipt submitted, locked, and automated splits processed ✓"})
 
-# ── SUB-BRANCH STAGE OPERATIONS (100 KES Fixed to Welfare) ──
-
+# ── SUB-BRANCH STAGE OPERATIONS (KES 50 or 100, 100% to Welfare) ──
+# In sub_branch_collect:
 @app.route("/stage/sub-branch-collect", methods=["POST"])
 @jwt_required()
 def sub_branch_collect():
     identity = get_jwt_identity()
     data = request.get_json()
+
+    fee = float(data.get("shimo_fee") or 0)
+    if fee <= 0:
+        return jsonify({"error": "Invalid fee amount"}), 400
     
     plate = data.get("plate", "").strip().upper()
     ticket_no = generate_ticket_number()
@@ -1521,7 +1671,7 @@ def sub_branch_collect():
         plate=plate,
         from_stage=data.get("from_stage", "Sub-Branch Stage"),
         to_stage=data.get("to_stage", "Destination"),
-        shimo_fee=100.0,
+        shimo_fee=fee,
         route_id=int(data.get("route_id", 1)) if data.get("route_id") else 1,
         matatu_id=int(data.get("matatu_id", 0)) if data.get("matatu_id") else 0,
         mode_of_payment="Cash",
@@ -1533,11 +1683,11 @@ def sub_branch_collect():
     )
     db.session.add(receipt)
 
-    # 2. 100% of KES 100 to Sub-Branch Welfare Pool
+    # 2. 100% of the fee to Sub-Branch Welfare Pool
     welfare_txn = WelfareLedger(
         type="Inflow",
         recipient_or_source=f"Sub-Branch Fee ({plate})",
-        amount=100.0,
+        amount=fee,
         reason=f"Sub-branch collection — Ticket {ticket_no}",
         date=date_issued
     )
@@ -1552,7 +1702,7 @@ def sub_branch_collect():
 def sub_branch_expense():
     data = request.get_json()
     amount = float(data.get("amount", 0))
-    
+
     expense_txn = WelfareLedger(
         type="Payout",
         recipient_or_source=data.get("recipient", "Sub-Stage Operational Expense"),
@@ -1581,6 +1731,8 @@ def get_sub_branch_welfare():
             "date": t.date
         } for t in txns]
     })
+
+
 # ================= POLICE POOL & PAYOUT ROUTES =================
 @app.route("/stage/police-pool", methods=["GET"])
 @jwt_required()
@@ -1614,12 +1766,13 @@ def get_police_pool():
         } for p in payouts]
     })
 
+
 @app.route("/stage/police-payout", methods=["POST"])
 @jwt_required()
 def record_police_payout():
     identity = get_jwt_identity()
     data = request.get_json()
-    
+
     amount = float(data.get("amount", 0))
     if amount <= 0:
         return jsonify({"error": "Invalid payout amount"}), 400
@@ -1638,13 +1791,13 @@ def record_police_payout():
     db.session.commit()
     return jsonify({"message": "Police payout processed and deducted from pool", "id": payout.id}), 201
 
-# ── ADMIN STAGE REVIEW & APPROVAL DESK ──
 
+# ── ADMIN STAGE REVIEW & APPROVAL DESK ──
 @app.route("/stage/transactions/review", methods=["GET"])
 @jwt_required()
 def get_stage_transactions_for_review():
     receipts = Receipt.query.filter_by(is_submitted=True).order_by(Receipt.created_at.desc()).all()
-    
+
     records = []
     main_total = 0.0
     sub_total = 0.0
@@ -1654,7 +1807,7 @@ def get_stage_transactions_for_review():
     for r in receipts:
         is_main = r.shimo_fee >= 200
         stage_type = "main" if is_main else "sub_branch"
-        
+
         if is_main:
             main_total += r.shimo_fee
             savings_total += 50.0
@@ -1691,6 +1844,7 @@ def approve_stage_transaction(id):
     db.session.commit()
     return jsonify({"message": f"Transaction for {receipt.plate} approved and verified by Admin ✓"})
 
+
 @app.route("/receipts/my", methods=["GET"])
 @jwt_required()
 def get_my_receipts():
@@ -1711,7 +1865,8 @@ def get_my_receipts():
         "po_box": r.po_box,
         "phone_number": r.phone_number
     } for r in receipts])
- 
+
+
 @app.route("/receipts/owner-trips", methods=["GET"])
 @jwt_required()
 def get_owner_trips():
@@ -1736,7 +1891,8 @@ def get_owner_trips():
         "po_box": r.po_box,
         "phone_number": r.phone_number
     } for r in receipts])
- 
+
+
 @app.route("/receipts/all", methods=["GET"])
 @jwt_required()
 def get_all_receipts():
@@ -1755,6 +1911,7 @@ def get_all_receipts():
         "po_box": r.po_box,
         "phone_number": r.phone_number
     } for r in receipts])
+
 
 # ================= ASSIGNMENTS =================
 @app.route("/assignments", methods=["POST"])
@@ -1986,13 +2143,33 @@ def get_matatu_expenditures(matatu_id):
 
 
 # ================= SAVINGS =================
-# 2. Upgrade deposit endpoint to support proofs & queue as pending_hr
+def approved_filter():
+    # legacy rows with no status are treated as approved
+    return db.or_(Saving.status == "approved", Saving.status.is_(None))
+
+
+def is_approved(s):
+    return (getattr(s, "status", None) or "approved") == "approved"
+
+
+def allowed_matatu_ids(identity):
+    """Matatus this user may deposit into / view the pool of."""
+    role = identity["role"]
+    if role in ("driver", "conductor"):
+        rows = Assignment.query.filter_by(member_id=identity["id"], is_active=True).all()
+        return [a.matatu_id for a in rows]
+    if role == "owner":
+        return [m.id for m in Matatu.query.filter_by(owner_member_no=identity["membership_no"]).all()]
+    return []
+
+
+# 2. Deposit endpoint supports proofs & queues as pending_hr
 @app.route("/savings/deposit", methods=["POST"])
 @jwt_required()
 def deposit_saving():
     identity = get_jwt_identity()
     role = identity["role"]
-    
+
     if role in ["hr", "admin", "director"]:
         return jsonify({"error": "HR and Admins cannot submit personal deposits on this route"}), 403
 
@@ -2004,7 +2181,10 @@ def deposit_saving():
         proof_file = upload["secure_url"]
 
     raw_matatu = request.form.get("matatu_id")
-    matatu_id = int(raw_matatu) if raw_matatu and str(raw_matatu).strip() != "null" and str(raw_matatu).strip() else None
+    matatu_id = int(raw_matatu) if raw_matatu and str(raw_matatu).strip() not in ("", "null", "undefined") else None
+
+    if matatu_id is not None and matatu_id not in allowed_matatu_ids(identity):
+        return jsonify({"error": "You can only save to a matatu assigned to you (or that you own)."}), 403
 
     saving = Saving(
         member_id=identity["id"],
@@ -2023,6 +2203,7 @@ def deposit_saving():
     db.session.commit()
     return jsonify({"message": "Deposit lodged. Sent to HR queue for verification.", "id": saving.id}), 201
 
+
 # 3. HR/Admin manually logs saving for a member (Forces status to pending_admin)
 @app.route("/savings/hr-add", methods=["POST"])
 @jwt_required()
@@ -2030,7 +2211,7 @@ def hr_add_saving():
     identity = get_jwt_identity()
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     proof_file = None
     if "proof_file" in request.files:
         file = request.files["proof_file"]
@@ -2039,7 +2220,7 @@ def hr_add_saving():
         proof_file = upload["secure_url"]
     else:
         return jsonify({"error": "Proof of payment document is strictly mandatory for manual overrides"}), 400
-        
+
     member_id = int(request.form.get("member_id"))
     amount = float(request.form.get("amount"))
     raw_matatu = request.form.get("matatu_id")
@@ -2048,7 +2229,7 @@ def hr_add_saving():
     mpesa_code = request.form.get("mpesa_code", "")
     description = request.form.get("description", "Administrative manual entry")
     date_val = request.form.get("date") or datetime.utcnow().strftime("%Y-%m-%d")
-    
+
     saving = Saving(
         member_id=member_id,
         matatu_id=matatu_id,
@@ -2059,10 +2240,10 @@ def hr_add_saving():
         payment_method=payment_method,
         mpesa_code=mpesa_code,
         proof_file=proof_file,
-        status="pending_admin" # HR manual inputs bypass HR verification but require Admin final approval
+        status="pending_admin"  # HR manual inputs bypass HR verification but require Admin final approval
     )
     db.session.add(saving)
-    
+
     member = Member.query.get(member_id)
     log = AuditLogPermanent(
         action="SAVING_ADMIN_MANUAL_LOGGED",
@@ -2086,11 +2267,11 @@ def prompt_member_saving():
     identity = get_jwt_identity()
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     data = request.get_json()
     member_id = int(data.get("member_id"))
     message = data.get("message", "Dear member, please remember to update and deposit your regular savings/shares to maintain your loan eligibility limit.")
-    
+
     # Send Notification in-system
     note = Notification(
         recipient_id=member_id,
@@ -2100,7 +2281,7 @@ def prompt_member_saving():
         message=message
     )
     db.session.add(note)
-    
+
     member = Member.query.get(member_id)
     log = AuditLogPermanent(
         action="SAVING_PROMPT_SENT",
@@ -2114,15 +2295,16 @@ def prompt_member_saving():
     )
     db.session.add(log)
     db.session.commit()
-    
+
     # Optional SMS Integration using AT
     if member and member.phone and sms:
         try:
             sms.send(message, [member.phone])
         except Exception as e:
             print("AT SMS Prompt failed:", e)
-            
+
     return jsonify({"message": "Prompt dispatched successfully"})
+
 
 # 5. Get Pending Savings for approvals
 @app.route("/savings/pending", methods=["GET"])
@@ -2130,15 +2312,15 @@ def prompt_member_saving():
 def get_pending_savings():
     identity = get_jwt_identity()
     role = identity["role"]
-    
+
     if role not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     if role == "hr":
         pending_list = Saving.query.filter_by(status="pending_hr").all()
     else:
         pending_list = Saving.query.filter(Saving.status.in_(["pending_hr", "pending_admin"])).all()
-        
+
     result = []
     for s in pending_list:
         member = Member.query.get(s.member_id)
@@ -2159,6 +2341,7 @@ def get_pending_savings():
         })
     return jsonify(result)
 
+
 # 5. HR first approval: Promotes pending_hr to pending_admin
 @app.route("/savings/<int:id>/hr-recommend", methods=["PUT"])
 @jwt_required()
@@ -2166,13 +2349,13 @@ def hr_recommend_saving(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     saving = Saving.query.get_or_404(id)
     if saving.status != "pending_hr":
         return jsonify({"error": "Can only recommend items with status 'pending_hr'"}), 400
-        
+
     saving.status = "pending_admin"
-    
+
     member = Member.query.get(saving.member_id)
     log = AuditLogPermanent(
         action="SAVING_HR_RECOMMENDED",
@@ -2188,6 +2371,7 @@ def hr_recommend_saving(id):
     db.session.commit()
     return jsonify({"message": "Savings recommended and forwarded for final Admin sign-off ✓"})
 
+
 # 6. Admin final approval: Promotes status to approved (Active balances update)
 @app.route("/savings/<int:id>/admin-approve", methods=["PUT"])
 @jwt_required()
@@ -2195,13 +2379,13 @@ def admin_final_approve_saving(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Only Administrators or Directors can grant final savings approvals"}), 403
-        
+
     saving = Saving.query.get_or_404(id)
     if saving.status != "pending_admin":
         return jsonify({"error": "Can only approve items recommended or created in status 'pending_admin'"}), 400
-        
+
     saving.status = "approved"
-    
+
     db.session.add(Notification(
         recipient_id=saving.member_id,
         sender_name="Sacco Admin Desk",
@@ -2209,7 +2393,7 @@ def admin_final_approve_saving(id):
         title="Savings Deposit Confirmed! ✅",
         message=f"Admin has confirmed your contribution of KES {saving.amount:,.0f}. Funds have been credited to your active Sacco balance."
     ))
-    
+
     member = Member.query.get(saving.member_id)
     log = AuditLogPermanent(
         action="SAVING_ADMIN_APPROVED",
@@ -2225,20 +2409,21 @@ def admin_final_approve_saving(id):
     db.session.commit()
     return jsonify({"message": "Savings contribution approved and successfully credited ✓"})
 
+
 # 6. Approve savings contribution (Credits active balance)
 @app.route("/savings/<int:id>/approve", methods=["PUT"])
 @jwt_required()
 def approve_saving_transaction(id):
     identity = get_jwt_identity()
     saving = Saving.query.get_or_404(id)
-    
+
     if identity["role"] == "hr" and saving.status != "pending_hr":
         return jsonify({"error": "HR can only authorize standard member contributions"}), 403
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     saving.status = "approved"
-    
+
     db.session.add(Notification(
         recipient_id=saving.member_id,
         sender_name="SACCO Management",
@@ -2246,7 +2431,7 @@ def approve_saving_transaction(id):
         title="Savings Contribution Approved! ✅",
         message=f"Your deposit of KES {saving.amount:,.0f} has been verified and successfully credited."
     ))
-    
+
     member = Member.query.get(saving.member_id)
     log = AuditLogPermanent(
         action="SAVING_TRANSACTION_APPROVED",
@@ -2262,18 +2447,19 @@ def approve_saving_transaction(id):
     db.session.commit()
     return jsonify({"message": "Savings contribution approved and credited successfully ✓"})
 
+
 # 7. Reject savings transaction
 @app.route("/savings/<int:id>/reject", methods=["PUT"])
 @jwt_required()
 def reject_saving_transaction(id):
     identity = get_jwt_identity()
     saving = Saving.query.get_or_404(id)
-    
+
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     saving.status = "rejected"
-    
+
     db.session.add(Notification(
         recipient_id=saving.member_id,
         sender_name="SACCO Management",
@@ -2281,7 +2467,7 @@ def reject_saving_transaction(id):
         title="Savings Deposit Rejected ❌",
         message=f"Your deposit request of KES {saving.amount:,.0f} has been rejected due to invalid transaction details."
     ))
-    
+
     member = Member.query.get(saving.member_id)
     log = AuditLogPermanent(
         action="SAVING_TRANSACTION_REJECTED",
@@ -2297,6 +2483,7 @@ def reject_saving_transaction(id):
     db.session.commit()
     return jsonify({"message": "Savings contribution rejected"})
 
+
 # 9. Admin view to audit matatu savings
 @app.route("/admin/matatu-savings", methods=["GET"])
 @jwt_required()
@@ -2304,7 +2491,7 @@ def admin_matatu_savings():
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     savings = Saving.query.filter(Saving.matatu_id.isnot(None)).order_by(Saving.created_at.desc()).all()
     result = []
     for s in savings:
@@ -2324,15 +2511,16 @@ def admin_matatu_savings():
         })
     return jsonify(result)
 
+
 # 8. Report API Engine (Filtered weekly, monthly, yearly analytics)
 @app.route("/savings/reports", methods=["GET"])
 @jwt_required()
 def get_savings_reports():
     identity = get_jwt_identity()
-    period = request.args.get("period", "monthly") # 'weekly' | 'monthly' | 'yearly'
+    period = request.args.get("period", "monthly")  # 'weekly' | 'monthly' | 'yearly'
     member_id = request.args.get("member_id")
     matatu_id = request.args.get("matatu_id")
-    
+
     # General users can only query their own report histories
     if identity["role"] not in ["hr", "admin", "director"]:
         member_id = identity["id"]
@@ -2342,33 +2530,30 @@ def get_savings_reports():
         query = query.filter_by(member_id=int(member_id))
     if matatu_id:
         query = query.filter_by(matatu_id=int(matatu_id))
-        
+
     savings = query.order_by(Saving.date.desc()).all()
     now = datetime.utcnow()
-    
+
     filtered_savings = []
     for s in savings:
         try:
             s_date = datetime.strptime(s.date, "%Y-%m-%d")
         except ValueError:
             continue
-            
+
         if period == "weekly":
-            # Current calendar week (last 7 days)
             if now - s_date <= timedelta(days=7):
                 filtered_savings.append(s)
         elif period == "monthly":
-            # Current calendar month
             if s_date.year == now.year and s_date.month == now.month:
                 filtered_savings.append(s)
         elif period == "yearly":
-            # Current calendar year
             if s_date.year == now.year:
                 filtered_savings.append(s)
-                
+
     total_deposits = sum(f.amount for f in filtered_savings if f.transaction_type == "deposit")
     total_withdrawals = sum(f.amount for f in filtered_savings if f.transaction_type == "withdrawal")
-    
+
     return jsonify({
         "period": period,
         "total_deposits": total_deposits,
@@ -2388,64 +2573,65 @@ def get_savings_reports():
     })
 
 
-# 1. Update Personal & Matatu savings balances to ONLY sum "approved" transactions
+# 1. Personal & Matatu savings balances only sum "approved" transactions
 @app.route("/savings/my", methods=["GET"])
 @jwt_required()
 def get_my_savings():
     identity = get_jwt_identity()
-    savings = Saving.query.filter_by(
-        member_id=identity["id"]
-    ).order_by(Saving.created_at.desc()).all()
+    savings = Saving.query.filter_by(member_id=identity["id"]).order_by(Saving.created_at.desc()).all()
 
-    approved_savings = [s for s in savings if getattr(s, "status", "approved") == "approved"]
-    total = sum(
-        s.amount if s.transaction_type == "deposit" else -s.amount
-        for s in approved_savings
-    )
+    def net(rows):
+        return sum(s.amount if s.transaction_type == "deposit" else -s.amount for s in rows)
+
+    personal_approved = [s for s in savings if s.matatu_id is None and is_approved(s)]
+    matatu_approved = [s for s in savings if s.matatu_id is not None and is_approved(s)]
 
     return jsonify({
-        "balance": total,
+        "balance": net(personal_approved),                 # PERSONAL only
+        "matatu_contributed": net(matatu_approved),        # info only, not personal money
         "transactions": [{
-            "id": s.id,
-            "amount": s.amount,
-            "transaction_type": s.transaction_type,
-            "description": s.description,
-            "date": s.date,
-            "matatu_id": s.matatu_id,
+            "id": s.id, "amount": s.amount, "transaction_type": s.transaction_type,
+            "description": s.description, "date": s.date, "matatu_id": s.matatu_id,
             "status": getattr(s, "status", "approved"),
             "payment_method": getattr(s, "payment_method", "cash"),
             "mpesa_code": getattr(s, "mpesa_code", ""),
             "proof_file": getattr(s, "proof_file", None)
         } for s in savings]
     })
+
 
 @app.route("/savings/matatu/<int:matatu_id>", methods=["GET"])
 @jwt_required()
 def get_matatu_savings(matatu_id):
-    savings = Saving.query.filter_by(matatu_id=matatu_id).all()
-    approved_savings = [s for s in savings if getattr(s, "status", "approved") == "approved"]
-    total = sum(
-        s.amount if s.transaction_type == "deposit" else -s.amount
-        for s in approved_savings
-    )
-    return jsonify({
-        "balance": total,
-        "transactions": [{
-            "id": s.id,
-            "amount": s.amount,
-            "transaction_type": s.transaction_type,
-            "description": s.description,
-            "date": s.date,
-            "status": getattr(s, "status", "approved"),
+    identity = get_jwt_identity()
+    Matatu.query.get_or_404(matatu_id)
+    if identity["role"] not in ("admin", "director", "hr") and matatu_id not in allowed_matatu_ids(identity):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    rows = Saving.query.filter_by(matatu_id=matatu_id).filter(approved_filter()) \
+                       .order_by(Saving.created_at.desc()).all()
+
+    total = sum(s.amount if s.transaction_type == "deposit" else -s.amount for s in rows)
+    by_contributor, txs = {}, []
+    for s in rows:
+        m = Member.query.get(s.member_id)
+        who = {"id": m.id, "name": m.name, "role": m.role, "membership_no": m.membership_no} if m else {}
+        signed = s.amount if s.transaction_type == "deposit" else -s.amount
+        key = who.get("name", "Unknown")
+        by_contributor.setdefault(key, {"name": key, "role": who.get("role", ""), "total": 0.0})
+        by_contributor[key]["total"] += signed
+        txs.append({
+            "id": s.id, "amount": s.amount, "transaction_type": s.transaction_type,
+            "description": s.description, "date": s.date, "status": "approved",
             "payment_method": getattr(s, "payment_method", "cash"),
             "mpesa_code": getattr(s, "mpesa_code", ""),
-            "proof_file": getattr(s, "proof_file", None)
-        } for s in savings]
-    })
+            "proof_file": getattr(s, "proof_file", None),
+            "submitted_by": who
+        })
+    return jsonify({"balance": total, "by_contributor": list(by_contributor.values()), "transactions": txs})
 
 
-
-# ================= LOANS =================
+# ================= LOANS (legacy simple loan requests) =================
 @app.route("/loans/request", methods=["POST"])
 @jwt_required()
 def request_loan():
@@ -2518,6 +2704,8 @@ def get_all_loans():
         })
 
     return jsonify(result)
+
+
 # ================= ADMIN: GET DEACTIVATED LOAN TYPES =================
 @app.route("/loan-types/deactivated", methods=["GET"])
 @jwt_required()
@@ -2525,15 +2713,15 @@ def get_deactivated_loan_types():
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized access level"}), 403
-        
+
     types = LoanType.query.filter_by(is_active=False).all()
     return jsonify([{
-        "id": t.id, 
-        "name": t.name, 
+        "id": t.id,
+        "name": t.name,
         "interest_rate": t.interest_rate,
-        "max_amount": t.max_amount, 
+        "max_amount": t.max_amount,
         "min_amount": t.min_amount,
-        "max_months": t.max_months, 
+        "max_months": t.max_months,
         "min_months": t.min_months,
         "description": t.description,
         "terms_file": getattr(t, "terms_file", None),
@@ -2547,6 +2735,7 @@ def get_deactivated_loan_types():
         "penalty_description": getattr(t, "penalty_description", "")
     } for t in types]), 200
 
+
 # ================= ADMIN: REACTIVATE LOAN TYPE =================
 @app.route("/loan-types/<int:id>/reactivate", methods=["PUT"])
 @jwt_required()
@@ -2554,13 +2743,13 @@ def reactivate_loan_type(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized access level"}), 403
-        
+
     lt = LoanType.query.get_or_404(id)
     if lt.is_active:
         return jsonify({"error": "This loan type is already active"}), 400
-        
+
     lt.is_active = True
-    
+
     log = AuditLogPermanent(
         action="LOAN_TYPE_REACTIVATED",
         category="loan",
@@ -2571,8 +2760,9 @@ def reactivate_loan_type(id):
     )
     db.session.add(log)
     db.session.commit()
-    
+
     return jsonify({"message": f"Loan type '{lt.name}' has been successfully reactivated."}), 200
+
 
 @app.route("/loans/<int:id>/approve", methods=["PUT"])
 @jwt_required()
@@ -2656,7 +2846,8 @@ def get_loan_repayments(id):
         "proof_file": r.proof_file
     } for r in repayments])
 
-# 2. HR ADD EXISTING LOAN (Updated to accept received_date & repayment start_date)
+
+# 2. HR ADD EXISTING LOAN (accepts received_date & repayment start_date)
 @app.route("/hr/existing-loan", methods=["POST"])
 @jwt_required()
 def hr_add_existing_loan():
@@ -2701,6 +2892,8 @@ def hr_add_existing_loan():
         approved_at=received_dt,
         created_at=received_dt
     )
+    # Pre-existing loans were already issued: no loan form / insurance / bank charges step
+    loan.requirements_status = "verified"
     db.session.add(loan)
     db.session.commit()
 
@@ -2710,9 +2903,9 @@ def hr_add_existing_loan():
         start = datetime.strptime(start_date_str, "%Y-%m-%d")
         remaining = amount_repaid
         for i in range(1, months + 1):
-            due = start + relativedelta(months=i-1)
+            due = start + relativedelta(months=i - 1)
             sched = LoanRepaymentSchedule(
-                loan_id=loan.id, 
+                loan_id=loan.id,
                 installment_no=i,
                 due_date=due.strftime("%Y-%m-%d"),
                 amount_due=monthly_installment,
@@ -2729,9 +2922,9 @@ def hr_add_existing_loan():
         print("Schedule error:", e)
 
     log = LoanAuditLog(
-        loan_id=loan.id, 
+        loan_id=loan.id,
         action="EXISTING_LOAN_ONBOARDED",
-        performed_by=identity["id"], 
+        performed_by=identity["id"],
         notes=f"Onboarded by HR: {identity['name']} | Received: {received_date_str} | Repay Start: {start_date_str}"
     )
     db.session.add(log)
@@ -2739,10 +2932,9 @@ def hr_add_existing_loan():
 
     return jsonify({"message": "Existing loan recorded", "id": loan.id}), 201
 
-# ================= SACCO PAYMENTS =================
 
-# 1. Update Payment Creation to start as pending
-# 1. Update Payment Creation to start as pending
+# ================= SACCO PAYMENTS =================
+# 1. Payment creation starts as pending
 @app.route("/sacco-payments", methods=["POST"])
 @jwt_required()
 def create_sacco_payment():
@@ -2753,10 +2945,10 @@ def create_sacco_payment():
         file_type = file.content_type or ""
         upload = cloudinary.uploader.upload(file, resource_type="raw" if "image" not in file_type else "image")
         proof_file = upload["secure_url"]
-        
+
     raw_matatu = request.form.get("matatu_id")
     matatu_id = int(raw_matatu) if raw_matatu and str(raw_matatu).strip() else None
-    
+
     payment = SaccoPayment(
         member_id=identity["id"],
         matatu_id=matatu_id,
@@ -2765,31 +2957,32 @@ def create_sacco_payment():
         proof_file=proof_file,
         date=request.form.get("date"),
         notes=request.form.get("notes", ""),
-        status="pending"  # <-- Set default status to pending
+        status="pending"  # default status is pending
     )
     db.session.add(payment)
     db.session.commit()
     return jsonify({"message": "Payment recorded, awaiting admin approval", "id": payment.id}), 201
 
-# 2. Update Member view to return status safely
+
+# 2. Member view returns status safely
 @app.route("/sacco-payments/my", methods=["GET"])
 @jwt_required()
 def get_my_sacco_payments():
     identity = get_jwt_identity()
     payments = SaccoPayment.query.filter_by(member_id=identity["id"]).order_by(SaccoPayment.created_at.desc()).all()
     return jsonify([{
-        "id": p.id, 
-        "payment_type": p.payment_type, 
+        "id": p.id,
+        "payment_type": p.payment_type,
         "amount": p.amount,
-        "matatu_id": p.matatu_id, 
+        "matatu_id": p.matatu_id,
         "proof_file": p.proof_file,
-        "date": p.date, 
+        "date": p.date,
         "notes": p.notes,
-        "status": getattr(p, "status", "approved") or "approved" # fallback support for legacy rows
+        "status": getattr(p, "status", "approved") or "approved"  # fallback support for legacy rows
     } for p in payments])
 
-# 3. Update Admin Global list to return status safely
-# 3. Update Admin Global list to return status safely
+
+# 3. Admin Global list returns status safely
 @app.route("/sacco-payments/all", methods=["GET"])
 @jwt_required()
 def get_all_sacco_payments():
@@ -2798,20 +2991,21 @@ def get_all_sacco_payments():
     for p in payments:
         member = Member.query.get(p.member_id)
         result.append({
-            "id": p.id, 
-            "payment_type": p.payment_type, 
+            "id": p.id,
+            "payment_type": p.payment_type,
             "amount": p.amount,
-            "matatu_id": p.matatu_id, 
-            "proof_file": p.proof_file, 
+            "matatu_id": p.matatu_id,
+            "proof_file": p.proof_file,
             "date": p.date,
-            "notes": p.notes, 
+            "notes": p.notes,
             "member_name": member.name if member else "",
             "membership_no": member.membership_no if member else "",
-            "status": getattr(p, "status", "approved") or "approved" # fallback support for legacy rows
+            "status": getattr(p, "status", "approved") or "approved"  # fallback support for legacy rows
         })
     return jsonify(result)
 
-    # owner documnt 
+
+# owner document
 @app.route("/documents", methods=["POST"])
 def add_document():
     file = request.files.get("file")
@@ -2831,7 +3025,8 @@ def add_document():
     db.session.add(doc)
     db.session.commit()
     return jsonify({"message": "Document added"}), 201
-# 4. Admin Approvals Endpoint
+
+
 # 4. Admin Approvals Endpoint
 @app.route("/sacco-payments/<int:id>/approve", methods=["PUT"])
 @jwt_required()
@@ -2839,10 +3034,10 @@ def approve_sacco_payment(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     payment = SaccoPayment.query.get_or_404(id)
     payment.status = "approved"
-    
+
     # Audit log entry
     member = Member.query.get(payment.member_id)
     log = AuditLogPermanent(
@@ -2856,7 +3051,7 @@ def approve_sacco_payment(id):
         details=f"Approved KES {payment.amount:,.2f} SACCO payment ({payment.payment_type})"
     )
     db.session.add(log)
-    
+
     # Notify borrower
     db.session.add(Notification(
         recipient_id=payment.member_id,
@@ -2865,9 +3060,10 @@ def approve_sacco_payment(id):
         title="SACCO Payment Approved! ✅",
         message=f"Your Sacco Payment of KES {payment.amount:,.2f} for '{payment.payment_type}' has been verified and approved."
     ))
-    
+
     db.session.commit()
     return jsonify({"message": "Sacco payment approved successfully ✓"})
+
 
 # 5. Admin Rejection Endpoint
 @app.route("/sacco-payments/<int:id>/reject", methods=["PUT"])
@@ -2876,10 +3072,10 @@ def reject_sacco_payment(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     payment = SaccoPayment.query.get_or_404(id)
     payment.status = "rejected"
-    
+
     # Audit log entry
     member = Member.query.get(payment.member_id)
     log = AuditLogPermanent(
@@ -2895,17 +3091,19 @@ def reject_sacco_payment(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Sacco payment rejected"})
+
+
 # ================= LOAN TYPES (HR manages) =================
 @app.route("/loan-types", methods=["GET"])
 def get_loan_types():
     types = LoanType.query.filter_by(is_active=True).all()
     return jsonify([{
-        "id": t.id, 
-        "name": t.name, 
+        "id": t.id,
+        "name": t.name,
         "interest_rate": t.interest_rate,
-        "max_amount": t.max_amount, 
+        "max_amount": t.max_amount,
         "min_amount": t.min_amount,
-        "max_months": t.max_months, 
+        "max_months": t.max_months,
         "min_months": t.min_months,
         "description": t.description,
         "terms_file": getattr(t, "terms_file", None),
@@ -2919,16 +3117,17 @@ def get_loan_types():
         "penalty_description": getattr(t, "penalty_description", "")
     } for t in types])
 
+
 @app.route("/loan-types", methods=["POST"])
 @jwt_required()
 def create_loan_type():
     data = request.get_json()
     lt = LoanType(
-        name=data["name"], 
+        name=data["name"],
         interest_rate=float(data["interest_rate"]),
-        max_amount=float(data["max_amount"]), 
+        max_amount=float(data["max_amount"]),
         min_amount=float(data["min_amount"]),
-        max_months=int(data["max_months"]), 
+        max_months=int(data["max_months"]),
         min_months=int(data["min_months"]),
         description=data.get("description", "")
     )
@@ -2953,7 +3152,7 @@ def update_loan_type(id):
     identity = get_jwt_identity()
     lt = LoanType.query.get_or_404(id)
     data = request.get_json()
-    
+
     old_rate = lt.interest_rate
     new_rate = float(data.get("interest_rate", old_rate))
     rate_changed = old_rate != new_rate
@@ -2968,7 +3167,7 @@ def update_loan_type(id):
     # If rate or terms changed, alert all active borrowers under this loan type
     active_loans = LoanApplication.query.filter(
         LoanApplication.loan_type_id == id,
-        LoanApplication.status.in_(["pending", "approved", "disbursed", "repaying"])
+        LoanApplication.status.in_(["pending", "approved", "requirements_pending", "disbursed", "repaying"])
     ).all()
 
     for loan in active_loans:
@@ -2981,7 +3180,7 @@ def update_loan_type(id):
         msg = f"The terms/rules for your '{lt.name}' loan have been updated by administration."
         if rate_changed:
             msg += f" Interest rate has been updated to {new_rate}%. Please review and submit your commitment approval."
-        
+
         note = Notification(
             recipient_id=loan.member_id,
             sender_name="SACCO Management",
@@ -2993,6 +3192,8 @@ def update_loan_type(id):
 
     db.session.commit()
     return jsonify({"message": f"Loan type updated and {len(active_loans)} borrowers notified."})
+
+
 # ================= BORROWER COMMITMENT (AGREE / DISAGREE) =================
 @app.route("/loan-applications/<int:id>/commitment", methods=["PUT"])
 @jwt_required()
@@ -3008,7 +3209,7 @@ def borrower_loan_commitment(id):
 
     loan.rate_commitment_status = status
     loan.rate_change_pending = False
-    
+
     # Permanent audit record
     log = AuditLogPermanent(
         action=f"BORROWER_RATE_COMMITMENT_{status.upper()}",
@@ -3023,6 +3224,7 @@ def borrower_loan_commitment(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": f"Commitment '{status}' recorded successfully and sent to HR/Admin."})
+
 
 # ================= TWO-TIER APPROVAL (HR -> ADMIN) =================
 @app.route("/loan-applications/<int:id>/hr-recommend", methods=["PUT"])
@@ -3043,62 +3245,191 @@ def hr_recommend_loan(id):
         performed_by_id=identity["id"],
         performed_by_name=identity["name"],
         performed_by_role=identity["role"],
-        details=f"Loan #{id} recommended by HR. Awaiting final Admin approval and disbursement."
+        details=f"Loan #{id} recommended by HR. Awaiting final Admin approval."
     )
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Loan recommended by HR. Sent to Admin for final authorization."})
+
+
+def start_requirements_phase(loan, identity, bank_charges_amount=None, insurance_amount=None):
+    """Before the cheque is issued, the borrower must submit:
+    (1) Signed Loan Form, (2) Insurance payment, (3) Bank charges recovery."""
+    calculated_insurance = float(insurance_amount) if insurance_amount is not None else round(loan.amount * 0.01, 2)
+    calculated_bank_charges = float(bank_charges_amount) if bank_charges_amount is not None else 500.0
+
+    loan.status = "requirements_pending"
+    loan.requirements_status = "pending"
+    loan.requirements_notes = None
+    loan.insurance_amount = calculated_insurance
+    loan.bank_charges_amount = calculated_bank_charges
+
+    member = Member.query.get(loan.member_id)
+
+    db.session.add(Notification(
+        recipient_id=loan.member_id,
+        sender_name="SACCO Management",
+        type="loan",
+        title="Loan Approved – Submit Requirements Before Cheque Issuance 📄",
+        message=(f"Your loan of KES {loan.amount:,.0f} is approved! Before your cheque is issued, submit: "
+                 f"(1) Signed Loan Form, (2) Insurance fee of KES {loan.insurance_amount:,.0f}, "
+                 f"(3) Bank charges recovery of KES {loan.bank_charges_amount:,.0f}.")
+    ))
+
+    if member and member.phone and sms:
+        try:
+            sms.send(
+                f"SACCO: Loan #{loan.id} approved! To receive your cheque, submit your signed Loan Form, "
+                f"pay Insurance (KES {loan.insurance_amount:,.0f}) and Bank Charges (KES {loan.bank_charges_amount:,.0f}) in the portal.",
+                [member.phone]
+            )
+        except Exception as e:
+            print("SMS error:", e)
+
+    db.session.add(AuditLogPermanent(
+        action="LOAN_APPROVED_AWAITING_PRE_CHEQUE_REQUIREMENTS",
+        category="loan",
+        member_id=loan.member_id,
+        performed_by_id=identity["id"],
+        performed_by_name=identity["name"],
+        performed_by_role=identity["role"],
+        details=f"Loan #{loan.id} awaiting requirements: Insurance KES {loan.insurance_amount}, Bank Charges KES {loan.bank_charges_amount}."
+    ))
 
 @app.route("/loan-applications/<int:id>/admin-final-approve", methods=["PUT"])
 @jwt_required()
 def admin_final_approve(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
-        return jsonify({"error": "Only Admin or Director can grant final approval and disbursement."}), 403
+        return jsonify({"error": "Only Admin or Director can grant final approval."}), 403
+
+    data = request.get_json(silent=True) or {}
+    loan = LoanApplication.query.get_or_404(id)
+    start_requirements_phase(loan, identity, data.get("bank_charges_amount"))
+    db.session.commit()
+    return jsonify({"message": "Approved. Borrower must submit loan form, insurance and bank charges before disbursement."})
+
+# 1. In MIGRATIONS list:
+MIGRATIONS = [
+    # ... previous migrations ...
+    "ALTER TABLE loan_application ADD COLUMN loan_form_file TEXT",
+    "ALTER TABLE loan_application ADD COLUMN insurance_file TEXT",
+    "ALTER TABLE loan_application ADD COLUMN insurance_amount FLOAT DEFAULT 0",
+    "ALTER TABLE loan_application ADD COLUMN insurance_ref VARCHAR(60)",
+    "ALTER TABLE loan_application ADD COLUMN bank_charges_amount FLOAT DEFAULT 0",
+    "ALTER TABLE loan_application ADD COLUMN bank_charges_ref VARCHAR(60)",
+    "ALTER TABLE loan_application ADD COLUMN bank_charges_method VARCHAR(20)",
+    "ALTER TABLE loan_application ADD COLUMN bank_charges_file TEXT",
+    "ALTER TABLE loan_application ADD COLUMN cheque_no VARCHAR(60)",
+    "ALTER TABLE loan_application ADD COLUMN cheque_date VARCHAR(30)",
+    "ALTER TABLE loan_application ADD COLUMN requirements_status VARCHAR(30) DEFAULT 'none'",
+    "ALTER TABLE loan_application ADD COLUMN requirements_notes TEXT",
+]
+
+# 2. Submit Requirements (Allow both Borrower and HR/Admin)
+@app.route("/loan-applications/<int:id>/submit-requirements", methods=["POST"])
+@jwt_required()
+def submit_loan_requirements(id):
+    identity = get_jwt_identity()
+    user_role = identity.get("role")
+    loan = LoanApplication.query.get_or_404(id)
+
+    # Permission check: must be either the borrower OR HR / Admin / Director
+    if user_role not in ["hr", "admin", "director"] and loan.member_id != identity["id"]:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if loan.status != "requirements_pending" and loan.requirements_status == "verified":
+        return jsonify({"error": "This loan is not awaiting pre-cheque requirements"}), 400
+
+    form_file = request.files.get("loan_form")
+    insurance_file = request.files.get("insurance")
+    bank_charges_file = request.files.get("bank_charges_file")
+
+    insurance_amount = float(request.form.get("insurance_amount") or 0)
+    insurance_ref = (request.form.get("insurance_ref") or "").strip().upper()
+
+    bank_charges_amount = float(request.form.get("bank_charges_amount") or 0)
+    bank_charges_ref = (request.form.get("bank_charges_ref") or "").strip().upper()
+    bank_charges_method = request.form.get("bank_charges_method", "mpesa")
+
+    # Validation
+    if not (form_file or loan.loan_form_file):
+        return jsonify({"error": "Signed physical Loan Form upload is required"}), 400
+    if insurance_amount <= 0:
+        return jsonify({"error": "Valid insurance payment amount is required"}), 400
+    if bank_charges_amount <= 0:
+        return jsonify({"error": "Valid bank charges recovery amount is required"}), 400
+    if not (insurance_ref or loan.insurance_ref):
+        return jsonify({"error": "Insurance payment reference code is required"}), 400
+    if not (bank_charges_ref or loan.bank_charges_ref):
+        return jsonify({"error": "Bank charges payment reference code is required"}), 400
+
+    # Upload files to Cloudinary if provided
+    if form_file:
+        loan.loan_form_file = upload_any(form_file)
+    if insurance_file:
+        loan.insurance_file = upload_any(insurance_file)
+    if bank_charges_file:
+        loan.bank_charges_file = upload_any(bank_charges_file)
+
+    loan.insurance_amount = insurance_amount
+    loan.insurance_ref = insurance_ref
+    loan.bank_charges_amount = bank_charges_amount
+    loan.bank_charges_ref = bank_charges_ref
+    loan.bank_charges_method = bank_charges_method
+    loan.requirements_status = "submitted"
+    loan.requirements_notes = None
+
+    submitted_by = f"HR {identity['name']}" if user_role in ["hr", "admin", "director"] else "Borrower"
+
+    notify_roles(
+        ["admin", "director", "hr"],
+        "Pre-Cheque Requirements Submitted 📄",
+        f"Loan #{loan.id}: Form uploaded, Insurance (KES {insurance_amount:,.0f}, Ref: {insurance_ref}), "
+        f"Bank Charges (KES {bank_charges_amount:,.0f}, Ref: {bank_charges_ref}) submitted by {submitted_by}. Cheque ready for issuance.",
+        sender=submitted_by
+    )
+
+    db.session.add(LoanAuditLog(
+        loan_id=id,
+        action="REQUIREMENTS_SUBMITTED",
+        performed_by=identity["id"],
+        notes=f"Submitted by {submitted_by} | Insurance: KES {insurance_amount} (Ref: {insurance_ref}) | Bank Charges: KES {bank_charges_amount} (Ref: {bank_charges_ref})"
+    ))
+    db.session.commit()
+    return jsonify({"message": f"Requirements and payment proofs submitted successfully by {submitted_by} ✓"}), 200
+
+# 3. Final Verification & Cheque Issuance
+@app.route("/loan-applications/<int:id>/verify-requirements", methods=["PUT"])
+@jwt_required()
+def verify_loan_requirements(id):
+    identity = get_jwt_identity()
+    if identity["role"] not in ["admin", "director"]:
+        return jsonify({"error": "Only Administrators or Directors can issue cheques and grant final approval"}), 403
 
     loan = LoanApplication.query.get_or_404(id)
+    if loan.requirements_status != "submitted":
+        return jsonify({"error": "Requirements have not been submitted for this loan"}), 400
+
+    data = request.get_json(silent=True) or {}
+    cheque_no = data.get("cheque_no", "").strip().upper()
+    cheque_date = data.get("cheque_date") or datetime.utcnow().strftime("%Y-%m-%d")
+
+    if not cheque_no:
+        return jsonify({"error": "Cheque Number is required before final authorization"}), 400
+
+    loan.cheque_no = cheque_no
+    loan.cheque_date = cheque_date
+    loan.requirements_status = "verified"
     loan.admin_approved = True
-    loan.status = "disbursed"
     loan.approved_by = identity["id"]
     loan.approved_at = datetime.utcnow()
+    loan.status = "disbursed"
 
-    # Generate schedules upon disbursement
+    generate_schedule(loan)
     loan_type = LoanType.query.get(loan.loan_type_id)
-    freq = getattr(loan_type, "repayment_frequency", "monthly")
-    start_rule = getattr(loan_type, "repayment_start_rule", "next_period")
-    start_date = datetime.utcnow()
 
-    for i in range(1, loan.repayment_months + 1):
-        step = i - 1 if start_rule == "same_day" else i
-        if freq == "daily":
-            due_date = start_date + timedelta(days=step)
-        elif freq == "weekly":
-            due_date = start_date + timedelta(weeks=step)
-        else:
-            try:
-                from dateutil.relativedelta import relativedelta
-                due_date = start_date + relativedelta(months=step)
-            except ImportError:
-                due_date = start_date + timedelta(days=step * 30)
-
-        db.session.add(LoanRepaymentSchedule(
-            loan_id=loan.id,
-            installment_no=i,
-            due_date=due_date.strftime("%Y-%m-%d"),
-            amount_due=loan.monthly_installment
-        ))
-
-    # Send Notification to Borrower
-    db.session.add(Notification(
-        recipient_id=loan.member_id,
-        sender_name="SACCO Management",
-        type="loan",
-        title="Loan Disbursed! ✅",
-        message=f"Your loan request of KES {loan.amount:,.0f} has received final Admin authorization and has been disbursed."
-    ))
-
-    # --- BOOKKEEPING HOOK A: DISBURSEMENT RECORD ---
-    # FIX: Changed loan.loan_type to loan_type.name
+    # 1. Disbursement Ledger Entry
     record_ledger_entry(
         loan_id=loan.id,
         member_id=loan.member_id,
@@ -3108,12 +3439,129 @@ def admin_final_approve(id):
         credit_code="1200",
         credit_name="Sacco Cash/Bank Account (Asset)",
         amount=loan.amount,
-        description=f"Disbursement of {loan_type.name if loan_type else 'Standard'} Loan #{loan.id}",
-        date=datetime.utcnow().strftime("%Y-%m-%d")
+        description=f"Disbursement of Loan #{loan.id} via Cheque #{cheque_no}",
+        date=cheque_date
     )
 
+    # 2. Bank Charges Recovery Ledger Entry
+    if (loan.bank_charges_amount or 0) > 0:
+        record_ledger_entry(
+            loan_id=loan.id,
+            member_id=loan.member_id,
+            transaction_type="bank_charges_recovery",
+            debit_code="1200",
+            debit_name="Sacco Cash/Bank Account (Asset)",
+            credit_code="4300",
+            credit_name="Bank Charges Recovery (Income)",
+            amount=loan.bank_charges_amount,
+            description=f"Bank charges recovered on Loan #{loan.id} (Ref: {loan.bank_charges_ref})",
+            date=cheque_date
+        )
+
+    # 3. Insurance Fee Ledger Entry
+    if (loan.insurance_amount or 0) > 0:
+        record_ledger_entry(
+            loan_id=loan.id,
+            member_id=loan.member_id,
+            transaction_type="insurance_recovery",
+            debit_code="1200",
+            debit_name="Sacco Cash/Bank Account (Asset)",
+            credit_code="2400",
+            credit_name="Loan Insurance Fund (Liability)",
+            amount=loan.insurance_amount,
+            description=f"Insurance fee recovered on Loan #{loan.id} (Ref: {loan.insurance_ref})",
+            date=cheque_date
+        )
+
+    member = Member.query.get(loan.member_id)
+    db.session.add(Notification(
+        recipient_id=loan.member_id,
+        sender_name="SACCO Management",
+        type="loan",
+        title="Cheque Ready for Collection! 🎟️",
+        message=(f"Loan Form, Insurance, and Bank Charges are verified! Final approval granted. "
+                 f"Cheque #{cheque_no} for KES {loan.amount:,.0f} has been prepared. Collect it at the SACCO office.")
+    ))
+
+    if member and member.phone and sms:
+        try:
+            sms.send(
+                f"✅ SACCO CHEQUE READY: Loan #{loan.id} approved! Cheque #{cheque_no} for KES {loan.amount:,.0f} is ready for collection at the office.",
+                [member.phone]
+            )
+        except Exception as e:
+            print("SMS error:", e)
+
+    db.session.add(AuditLogPermanent(
+        action="LOAN_FINAL_APPROVED_CHEQUE_ISSUED",
+        category="loan",
+        member_id=loan.member_id,
+        performed_by_id=identity["id"],
+        performed_by_name=identity["name"],
+        performed_by_role=identity["role"],
+        details=f"Loan #{loan.id} finalized. Cheque #{cheque_no} issued for KES {loan.amount}."
+    ))
+
     db.session.commit()
-    return jsonify({"message": "Final approval complete. Loan disbursed and schedule activated."})
+    return jsonify({
+        "message": f"Requirements verified. Final approval granted & Cheque #{cheque_no} issued ✓",
+        "cheque_no": cheque_no
+    }), 200
+
+@app.route("/loan-applications/<int:id>/security-rehold", methods=["PUT"])
+@jwt_required()
+def rehold_security_logbook(id):
+    """Allows HR or Admin to place a previously released logbook back on hold as security."""
+    identity = get_jwt_identity()
+    if identity["role"] not in ["hr", "admin", "director"]:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    loan = LoanApplication.query.get_or_404(id)
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "Collateral re-instated as loan security")
+
+    # Put back on hold
+    loan.security_status = "held"
+    if loan.status == "defaulted":
+        loan.status = "repaying"
+
+    db.session.add(Notification(
+        recipient_id=loan.member_id,
+        sender_name="SACCO Management",
+        type="loan",
+        title="Logbook Placed Back on Hold 🔒",
+        message=f"Loan #{id}: Your vehicle logbook ({loan.security_logbook_no or 'on file'}) has been placed back on hold as security. Reason: {reason}."
+    ))
+
+    db.session.add(AuditLogPermanent(
+        action="LOAN_SECURITY_REHELD",
+        category="loan",
+        member_id=loan.member_id,
+        performed_by_id=identity["id"],
+        performed_by_name=identity["name"],
+        performed_by_role=identity["role"],
+        details=f"Logbook placed back on hold for Loan #{id}. Reason: {reason}"
+    ))
+
+    db.session.commit()
+    return jsonify({"message": f"Logbook {loan.security_logbook_no or ''} placed back on hold as security ✓"}), 200
+
+@app.route("/loan-applications/<int:id>/reject-requirements", methods=["PUT"])
+@jwt_required()
+def reject_loan_requirements(id):
+    identity = get_jwt_identity()
+    if identity["role"] not in ["hr", "admin", "director"]:
+        return jsonify({"error": "Unauthorized"}), 403
+    loan = LoanApplication.query.get_or_404(id)
+    notes = (request.get_json(silent=True) or {}).get("notes", "Please correct and resubmit")
+    loan.requirements_status = "rejected"
+    loan.requirements_notes = notes
+    db.session.add(Notification(
+        recipient_id=loan.member_id, sender_name="SACCO Management", type="loan",
+        title="Loan Requirements Rejected ❌", message=f"Loan #{id}: {notes}"))
+    db.session.commit()
+    return jsonify({"message": "Requirements returned to borrower"})
+
 
 # ================= DEACTIVATION (ADMIN SOFT-DELETE) =================
 @app.route("/loan-applications/<int:id>/deactivate", methods=["PUT"])
@@ -3141,6 +3589,7 @@ def deactivate_loan(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": f"Loan #{id} has been deactivated and archived."})
+
 
 # ================= BORROWER RESPOND TO INFO REQUEST (WITH FILE) =================
 @app.route("/loan-applications/<int:id>/respond-info", methods=["PUT"])
@@ -3172,14 +3621,15 @@ def respond_info_with_upload(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Document & response uploaded. Loan re-queued for evaluation."})
-# ================= PENALTY CLEARANCE & APPROVAL =================
-# ================= MEMBER: SUBMIT SEPARATE PENALTY CLEARANCE =================
+
+
+# ================= LEGACY PENALTY CLEARANCE (kept for old penalty balances) =================
 @app.route("/loan-applications/<int:id>/pay-penalty", methods=["POST"])
 @jwt_required()
 def submit_penalty_payment(id):
     identity = get_jwt_identity()
     loan = LoanApplication.query.get_or_404(id)
-    
+
     if loan.member_id != identity["id"]:
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3191,7 +3641,7 @@ def submit_penalty_payment(id):
 
     loan.penalty_paid = (loan.penalty_paid or 0) + amount
     loan.penalty_status = "pending_approval"
-    
+
     # Track the transaction details inside audit log
     log = LoanAuditLog(
         loan_id=id,
@@ -3207,23 +3657,24 @@ def submit_penalty_payment(id):
         "penalty_paid": loan.penalty_paid,
         "penalty_status": loan.penalty_status
     }), 200
-# 1. Standalone helper function (no decorators)
+
+
+# Standalone helper function (no decorators)
 def record_ledger_entry(*args, **kwargs):
     """
     Safely writes double-entry bookkeeping transactions to the LoanLedgerEntry model.
     Supports both positional and flexible keyword mappings.
     """
-    # Map values to LoanLedgerEntry fields
     loan_id = kwargs.get("loan_id") or (args[0] if len(args) > 0 else None)
     member_id = kwargs.get("member_id") or (args[1] if len(args) > 1 else None)
     tx_type = kwargs.get("transaction_type") or (args[2] if len(args) > 2 else "repayment")
-    
+
     debit_code = kwargs.get("debit_code") or kwargs.get("debit_account_code") or (args[3] if len(args) > 3 else "1200")
     debit_name = kwargs.get("debit_name") or kwargs.get("debit_account_name") or (args[4] if len(args) > 4 else "Cash")
-    
+
     credit_code = kwargs.get("credit_code") or kwargs.get("credit_account_code") or (args[5] if len(args) > 5 else "1300")
     credit_name = kwargs.get("credit_name") or kwargs.get("credit_account_name") or (args[6] if len(args) > 6 else "Receivables")
-    
+
     amount = kwargs.get("amount") or (args[7] if len(args) > 7 else 0.0)
     desc = kwargs.get("description") or (args[8] if len(args) > 8 else "")
     date_str = kwargs.get("date") or (args[9] if len(args) > 9 else datetime.utcnow().strftime("%Y-%m-%d"))
@@ -3245,22 +3696,21 @@ def record_ledger_entry(*args, **kwargs):
     return entry
 
 
-# 2. Correctly decorated Flask View function
 @app.route("/loan-applications/<int:id>/approve-penalty", methods=["PUT"])
 @jwt_required()
 def approve_penalty_clearance(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     loan = LoanApplication.query.get_or_404(id)
     if loan.penalty_status != "pending_approval":
         return jsonify({"error": "No pending penalty payment found for this loan"}), 400
-        
+
     # Deduct cleared penalty amount from total penalty and total payable
     loan.penalty = max(0.0, (loan.penalty or 0) - (loan.penalty_paid or 0))
     loan.total_payable = max(0.0, loan.total_payable - loan.penalty_paid)
-            
+
     # --- BOOKKEEPING HOOK D: PENALTY CLEARANCE ---
     record_ledger_entry(
         loan_id=loan.id,
@@ -3286,11 +3736,11 @@ def approve_penalty_clearance(id):
         details=f"Approved KES {loan.penalty_paid:,.2f} penalty payment for Loan #{id}"
     )
     db.session.add(log_audit)
-    
+
     # Reset tracking flags
     loan.penalty_paid = 0.0
     loan.penalty_status = "cleared" if loan.penalty == 0 else "none"
-    
+
     # Re-enable regular repayment state if not defaulted elsewhere
     if loan.status == "defaulted" and loan.penalty == 0:
         loan.status = "repaying"
@@ -3298,21 +3748,21 @@ def approve_penalty_clearance(id):
     db.session.commit()
     return jsonify({"message": "Penalty payment approved. Normal repayments are now unblocked.", "status": loan.status}), 200
 
-# ================= ADMIN: REJECT PENALTY CLEARANCE =================
+
 @app.route("/loan-applications/<int:id>/reject-penalty", methods=["PUT"])
 @jwt_required()
 def reject_penalty_clearance(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     loan = LoanApplication.query.get_or_404(id)
     if loan.penalty_status != "pending_approval":
         return jsonify({"error": "No pending penalty payment found for this loan"}), 400
-        
+
     loan.penalty_paid = 0.0
     loan.penalty_status = "none"
-    
+
     log = AuditLogPermanent(
         action="LOAN_PENALTY_REJECTED",
         category="loan",
@@ -3326,6 +3776,7 @@ def reject_penalty_clearance(id):
     db.session.commit()
     return jsonify({"message": "Penalty payment request rejected"}), 200
 
+
 # ================= LOAN ELIGIBILITY =================
 @app.route("/loans/eligibility", methods=["GET"])
 @jwt_required()
@@ -3334,9 +3785,9 @@ def check_eligibility():
     member_id = identity["id"]
     active_loan = LoanApplication.query.filter(
         LoanApplication.member_id == member_id,
-        LoanApplication.status.in_(["pending", "guarantors_pending", "approved", "disbursed", "repaying"])
+        LoanApplication.status.in_(["pending", "guarantors_pending", "hr_approved", "approved", "requirements_pending", "disbursed", "repaying"])
     ).first()
-    savings = Saving.query.filter_by(member_id=member_id).all()
+    savings = Saving.query.filter_by(member_id=member_id, matatu_id=None).filter(approved_filter()).all()
     total_savings = sum(s.amount if s.transaction_type == "deposit" else -s.amount for s in savings)
     payments = SaccoPayment.query.filter_by(member_id=member_id).all()
     total_contributions = sum(p.amount for p in payments)
@@ -3365,8 +3816,9 @@ def check_eligibility():
         "max_eligible_amount": max_eligible, "past_loans": len(past_loans),
         "defaults": len(defaults), "has_active_loan": active_loan is not None
     })
-# ================= LOAN APPLICATIONS =================
 
+
+# ================= LOAN APPLICATIONS =================
 @app.route("/loan-applications", methods=["POST"])
 @jwt_required()
 def apply_for_loan():
@@ -3404,8 +3856,9 @@ def apply_for_loan():
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Loan application submitted", "id": loan.id, "status": loan.status}), 201
- 
-# 3. GET MY APPLICATIONS (Updated to include received_date & start_date)
+
+
+# 3. GET MY APPLICATIONS (includes received_date, start_date, security & requirements info)
 @app.route("/loan-applications/my", methods=["GET"])
 @jwt_required()
 def get_my_applications():
@@ -3416,7 +3869,7 @@ def get_my_applications():
         loan_type = LoanType.query.get(l.loan_type_id)
         guarantors = LoanGuarantor.query.filter_by(loan_id=l.id).all()
         schedule = LoanRepaymentSchedule.query.filter_by(loan_id=l.id).order_by(LoanRepaymentSchedule.installment_no).all()
-        
+
         start_date = schedule[0].due_date if schedule else (l.created_at.strftime("%Y-%m-%d") if l.created_at else None)
         received_date = l.approved_at.strftime("%Y-%m-%d") if l.approved_at else (l.created_at.strftime("%Y-%m-%d") if l.created_at else None)
 
@@ -3436,16 +3889,18 @@ def get_my_applications():
             "approved_at": l.approved_at.isoformat() if l.approved_at else None,
             "guarantors": [{"id": g.id, "guarantor_id": g.guarantor_id, "status": g.status} for g in guarantors],
             "schedule": [{"id": s.id, "installment_no": s.installment_no, "due_date": s.due_date,
-                           "amount_due": s.amount_due, "amount_paid": s.amount_paid, "status": s.status}
-                          for s in schedule],
+                          "amount_due": s.amount_due, "amount_paid": s.amount_paid, "status": s.status}
+                         for s in schedule],
             "rate_change_pending": getattr(l, "rate_change_pending", False),
             "rate_change_notes": getattr(l, "rate_change_notes", ""),
             "rate_commitment_status": getattr(l, "rate_commitment_status", "none"),
-            # Add these two lines:
             "penalty_paid": getattr(l, "penalty_paid", 0.0),
-            "penalty_status": getattr(l, "penalty_status", "none")
+            "penalty_status": getattr(l, "penalty_status", "none"),
+            **loan_extras(l)
         })
     return jsonify(result)
+
+
 @app.route("/loan-applications/all", methods=["GET"])
 @jwt_required()
 def get_all_applications():
@@ -3455,33 +3910,29 @@ def get_all_applications():
         member = Member.query.get(l.member_id)
         loan_type = LoanType.query.get(l.loan_type_id)
         guarantors = LoanGuarantor.query.filter_by(loan_id=l.id).all()
-        
+
         # Calculate APPROVED savings only
-        savings = Saving.query.filter_by(member_id=l.member_id).all()
-        total_savings = sum(
-            s.amount if s.transaction_type == "deposit" else -s.amount 
-            for s in savings if getattr(s, "status", "approved") == "approved"
-        )
-        
+        savings = Saving.query.filter_by(member_id=l.member_id, matatu_id=None).filter(approved_filter()).all()
+        total_savings = sum(s.amount if s.transaction_type == "deposit" else -s.amount for s in savings)
         # Calculate general Sacco payments / Share Capital
         contributions = SaccoPayment.query.filter_by(member_id=l.member_id).all()
         total_contributions = sum(p.amount for p in contributions)
 
-         # ALWAYS parse pending_edit outside the if/else block:
+        # Parse pending_edit
         pending_edit_val = getattr(l, "pending_edit", None)
         if isinstance(pending_edit_val, str):
-                    try:
-                        pending_edit_val = json.loads(pending_edit_val)
-                    except Exception:
-                        pending_edit_val = None
-        
+            try:
+                pending_edit_val = json.loads(pending_edit_val)
+            except Exception:
+                pending_edit_val = None
+
         # --- MULTI-FACTOR RISK ASSESSMENT ENGINE ---
         if l.status == "defaulted":
             calculated_risk = "High"  # Immediate high risk for active defaults
         else:
             risk_points = 0.0
             total_collateral_pool = total_savings + total_contributions
-            
+
             # Check exposure relative to collateral pool
             if total_collateral_pool > 0:
                 exposure_ratio = l.amount / total_collateral_pool
@@ -3491,45 +3942,31 @@ def get_all_applications():
                     risk_points += 1.5  # Medium exposure
             else:
                 risk_points += 4.0  # High risk: No savings or Sacco payments recorded
-                
+
             # Reward successful repayments
-        if l.status == "defaulted":
-            calculated_risk = "High"  # Immediate high risk for active defaults
-        else:
-            risk_points = 0.0
-            total_collateral_pool = total_savings + total_contributions
-            
-            if total_collateral_pool > 0:
-                exposure_ratio = l.amount / total_collateral_pool
-                if exposure_ratio > 3.0:
-                    risk_points += 3.0
-                elif exposure_ratio > 1.5:
-                    risk_points += 1.5
-            else:
-                risk_points += 4.0
-                
             if l.amount_repaid > 0 and l.total_payable > 0:
                 repayment_percentage = l.amount_repaid / l.total_payable
                 if repayment_percentage >= 0.50:
                     risk_points -= 1.5
                 elif repayment_percentage >= 0.20:
                     risk_points -= 0.5
-                    
+
             accepted_guarantors_count = sum(1 for g in guarantors if g.status == "accepted")
             if accepted_guarantors_count >= 2:
                 risk_points -= 1.0
             elif accepted_guarantors_count == 0:
                 risk_points += 1.0
-                
+
+            # Logbook held as additional security lowers the risk
+            if (getattr(l, "security_status", "none") or "none") == "held":
+                risk_points -= 1.0
+
             if risk_points >= 3.0:
                 calculated_risk = "High"
             elif risk_points >= 1.5:
                 calculated_risk = "Medium"
             else:
                 calculated_risk = "Low"
-
-       
-        # -------------------------------------------
 
         result.append({
             "id": l.id, "amount": l.amount, "interest_rate": l.interest_rate,
@@ -3542,7 +3979,7 @@ def get_all_applications():
             "membership_no": member.membership_no if member else "",
             "loan_type": loan_type.name if loan_type else "",
             "supporting_doc": l.supporting_doc, "created_at": l.created_at.isoformat(),
-            "risk_score": calculated_risk,  # <-- Inject the new calculated risk score here
+            "risk_score": calculated_risk,
             "total_savings": total_savings, "total_contributions": total_contributions,
             "guarantors": [{"id": g.id, "guarantor_id": g.guarantor_id, "status": g.status} for g in guarantors],
             "rate_change_pending": getattr(l, "rate_change_pending", False),
@@ -3552,11 +3989,13 @@ def get_all_applications():
             "penalty_status": getattr(l, "penalty_status", "none"),
             "borrower_response": getattr(l, "borrower_response", ""),
             "borrower_doc": getattr(l, "borrower_doc", ""),
-            "pending_edit": pending_edit_val
-
+            "pending_edit": pending_edit_val,
+            **loan_extras(l)
         })
-        
+
     return jsonify(result)
+
+
 # ================= ADMIN: DEACTIVATE LOAN TYPE (SOFT-DELETE) WITH REPORT =================
 @app.route("/loan-types/<int:id>/deactivate", methods=["PUT"])
 @jwt_required()
@@ -3564,17 +4003,17 @@ def deactivate_loan_type(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director", "hr"]:
         return jsonify({"error": "Unauthorized permission level"}), 403
-        
+
     lt = LoanType.query.get_or_404(id)
     if not lt.is_active:
         return jsonify({"error": "This loan type is already deactivated"}), 400
-        
+
     # Soft deactivation: hide from future applications but preserve history
     lt.is_active = False
-    
+
     # Query all historical or current loan applications under this loan type
     loans_affected = LoanApplication.query.filter_by(loan_type_id=id).all()
-    
+
     report_data = []
     for loan in loans_affected:
         member = Member.query.get(loan.member_id)
@@ -3588,7 +4027,7 @@ def deactivate_loan_type(id):
             "balance": round(loan.total_payable - loan.amount_repaid, 2),
             "created_at": loan.created_at.strftime("%Y-%m-%d %H:%M:%S") if loan.created_at else "N/A"
         })
-        
+
     # Write to permanent audit log
     log = AuditLogPermanent(
         action="LOAN_TYPE_DEACTIVATED",
@@ -3600,7 +4039,7 @@ def deactivate_loan_type(id):
     )
     db.session.add(log)
     db.session.commit()
-    
+
     return jsonify({
         "message": f"Loan type '{lt.name}' has been soft-deactivated successfully.",
         "loan_type_name": lt.name,
@@ -3608,52 +4047,21 @@ def deactivate_loan_type(id):
     }), 200
 
 
+# Single-step approval now also goes through the requirements phase (no schedule/cheque yet)
 @app.route("/loan-applications/<int:id>/approve", methods=["PUT"])
 @jwt_required()
 def approve_application(id):
     identity = get_jwt_identity()
     loan = LoanApplication.query.get_or_404(id)
-    loan_type = LoanType.query.get(loan.loan_type_id)
-    
-    data = request.get_json() or {}
-    loan.status = "approved"
-    loan.approved_by = identity["id"]
-    loan.approved_at = datetime.utcnow()
+
+    data = request.get_json(silent=True) or {}
     loan.admin_notes = data.get("notes", "")
-    db.session.commit()
-
-    # Determine dynamic repayment schedule parameters
-    freq = getattr(loan_type, "repayment_frequency", "monthly") or "monthly"
-    start_rule = getattr(loan_type, "repayment_start_rule", "next_period") or "next_period"
-    start_date = datetime.utcnow()
-
-    for i in range(1, loan.repayment_months + 1):
-        # Calculate dynamic due date intervals
-        step = i - 1 if start_rule == "same_day" else i
-        
-        if freq == "daily":
-            due_date = start_date + timedelta(days=step)
-        elif freq == "weekly":
-            due_date = start_date + timedelta(weeks=step)
-        else:  # monthly
-            try:
-                from dateutil.relativedelta import relativedelta
-                due_date = start_date + relativedelta(months=step)
-            except ImportError:
-                due_date = start_date + timedelta(days=step * 30)
-
-        schedule = LoanRepaymentSchedule(
-            loan_id=loan.id, 
-            installment_no=i,
-            due_date=due_date.strftime("%Y-%m-%d"),
-            amount_due=loan.monthly_installment
-        )
-        db.session.add(schedule)
+    start_requirements_phase(loan, identity, data.get("bank_charges_amount"))
 
     log = LoanAuditLog(loan_id=loan.id, action="APPROVED", performed_by=identity["id"], notes=data.get("notes", ""))
     db.session.add(log)
     db.session.commit()
-    return jsonify({"message": "Loan approved and schedule generated successfully ✓"})
+    return jsonify({"message": "Loan approved ✓ Borrower must now submit loan form, insurance and bank charges before the cheque is issued."})
 
 
 @app.route("/loan-applications/<int:id>/reject", methods=["PUT"])
@@ -3668,7 +4076,8 @@ def reject_application(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Loan rejected"})
- 
+
+
 @app.route("/loan-applications/<int:id>/request-info", methods=["PUT"])
 @jwt_required()
 def request_more_info(id):
@@ -3681,15 +4090,17 @@ def request_more_info(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Info requested"})
- 
+
+
 @app.route("/loan-applications/<int:id>/disburse", methods=["PUT"])
 @jwt_required()
 def disburse_loan(id):
     identity = get_jwt_identity()
     loan = LoanApplication.query.get_or_404(id)
+    if getattr(loan, "requirements_status", "none") != "verified":
+        return jsonify({"error": "Cannot disburse: loan form, insurance and bank charges not verified"}), 400
     loan.status = "disbursed"
-    log = LoanAuditLog(loan_id=loan.id, action="DISBURSED", performed_by=identity["id"])
-    db.session.add(log)
+    db.session.add(LoanAuditLog(loan_id=loan.id, action="DISBURSED", performed_by=identity["id"]))
     db.session.commit()
     return jsonify({"message": "Loan disbursed"})
 
@@ -3699,11 +4110,11 @@ def disburse_loan(id):
 @jwt_required()
 def get_my_guarantor_requests():
     identity = get_jwt_identity()
-    requests = LoanGuarantor.query.filter_by(
+    requests_ = LoanGuarantor.query.filter_by(
         guarantor_id=identity["id"], status="pending"
     ).all()
     result = []
-    for g in requests:
+    for g in requests_:
         loan = LoanApplication.query.get(g.loan_id)
         member = Member.query.get(loan.member_id) if loan else None
         result.append({
@@ -3715,6 +4126,7 @@ def get_my_guarantor_requests():
             "created_at": g.created_at.isoformat()
         })
     return jsonify(result)
+
 
 @app.route("/guarantors/<int:id>/respond", methods=["PUT"])
 @jwt_required()
@@ -3737,9 +4149,9 @@ def respond_to_guarantor(id):
     db.session.commit()
     return jsonify({"message": f"Guarantor request {data['status']}"})
 
-# ================= LOAN PAYMENTS =================
-# 4. Direct Loan Payment Route (Updated to require HR approval as well)
 
+# ================= LOAN PAYMENTS =================
+# Direct Loan Payment Route (requires HR approval)
 @app.route("/loan-payments", methods=["POST"])
 @jwt_required()
 def make_loan_payment():
@@ -3765,7 +4177,6 @@ def make_loan_payment():
         db.session.add(account)
         db.session.commit()
 
-    # Fixed: Removed 'member_id' argument
     txn = RepaymentAccountTransaction(
         account_id=account.id,
         amount=amount,
@@ -3797,6 +4208,7 @@ def get_loan_payments(loan_id):
         "created_at": p.created_at.isoformat()
     } for p in payments])
 
+
 @app.route("/loan-applications/<int:id>/audit", methods=["GET"])
 @jwt_required()
 def get_loan_audit(id):
@@ -3807,47 +4219,128 @@ def get_loan_audit(id):
         "created_at": l.created_at.isoformat()
     } for l in logs])
 
-# ================= PENALTY =================
+
+# ================= LOGBOOK SECURITY (replaces money penalties) =================
 @app.route("/loan-applications/<int:id>/penalty", methods=["PUT"])
 @jwt_required()
 def add_penalty(id):
+    """Kept for compatibility with the old Penalties UI. A 'penalty' is now an
+    additional-security request: the borrower must upload the vehicle logbook.
+    No KES amount is added to the loan any more."""
+    identity = get_jwt_identity()
+    if identity["role"] not in ["admin", "director", "hr"]:
+        return jsonify({"error": "Unauthorized"}), 403
+
     loan = LoanApplication.query.get_or_404(id)
-    data = request.get_json()
-    loan.penalty += data["amount"]
-    loan.total_payable += data["amount"]
+    data = request.get_json(silent=True) or {}
+    reason = data.get("reason", "Failure to repay")
+
+    if (getattr(loan, "security_status", "none") or "none") in ("none", "rejected", "released"):
+        loan.security_status = "required"
     if loan.status == "repaying":
         loan.status = "defaulted"
 
-    # --- BOOKKEEPING HOOK C: ACCRUE PENALTY ASSET ---
-    record_ledger_entry(
-        loan_id=loan.id,
-        member_id=loan.member_id,
-        transaction_type="penalty_accrual",
-        debit_code="1350",
-        debit_name="Penalties Receivable (Asset)",
-        credit_code="4200",
-        credit_name="Penalty Revenue (Income)",
-        amount=data["amount"],
-        description=f"Manual penalty accrued on Loan #{loan.id}. Reason: {data.get('reason', '')}",
-        date=datetime.utcnow().strftime("%Y-%m-%d")
-    )
-
-    identity = get_jwt_identity()
-    log = LoanAuditLog(loan_id=id, action="PENALTY_ADDED", performed_by=identity["id"],
-                       notes=f"KES {data['amount']} penalty: {data.get('reason', '')}")
-    db.session.add(log)
+    db.session.add(Notification(
+        recipient_id=loan.member_id, sender_name="SACCO Management", type="loan",
+        title="Additional Security Required – Upload Logbook 📘",
+        message=f"Loan #{id}: please upload your vehicle logbook as additional security. Reason: {reason}"))
+    db.session.add(LoanAuditLog(loan_id=id, action="SECURITY_REQUESTED", performed_by=identity["id"],
+                                notes=f"Logbook security requested: {reason}"))
     db.session.commit()
-    return jsonify({"message": "Penalty added"})
+    return jsonify({"message": "Logbook security requested from borrower (no monetary penalty applied)"})
+
+
+@app.route("/loan-applications/<int:id>/security-logbook", methods=["POST"])
+@jwt_required()
+def upload_security_logbook(id):
+    identity = get_jwt_identity()
+    loan = LoanApplication.query.get_or_404(id)
+    if loan.member_id != identity["id"]:
+        return jsonify({"error": "Unauthorized"}), 403
+    f = request.files.get("logbook")
+    no = (request.form.get("logbook_no") or "").strip()
+    if not f or not no:
+        return jsonify({"error": "Logbook file and logbook/plate number are required"}), 400
+
+    loan.security_logbook = upload_any(f)
+    loan.security_logbook_no = no
+    loan.security_status = "pending_approval"
+    loan.security_notes = None
+    notify_roles(["hr", "admin", "director"], "Logbook Security Submitted 📘",
+                 f"Loan #{loan.id}: logbook '{no}' uploaded as additional security. Please verify.", sender="Borrower")
+    db.session.add(LoanAuditLog(loan_id=id, action="SECURITY_LOGBOOK_SUBMITTED",
+                                performed_by=identity["id"], notes=f"Logbook {no}"))
+    db.session.commit()
+    return jsonify({"message": "Logbook submitted for verification ✓"})
+
+
+@app.route("/loan-applications/<int:id>/security-approve", methods=["PUT"])
+@jwt_required()
+def approve_security_logbook(id):
+    identity = get_jwt_identity()
+    if identity["role"] not in ["hr", "admin", "director"]:
+        return jsonify({"error": "Unauthorized"}), 403
+    loan = LoanApplication.query.get_or_404(id)
+    if loan.security_status != "pending_approval":
+        return jsonify({"error": "No logbook awaiting approval"}), 400
+    loan.security_status = "held"
+    if loan.status == "defaulted":
+        loan.status = "repaying"
+    db.session.add(Notification(recipient_id=loan.member_id, sender_name="SACCO Management", type="loan",
+                                title="Logbook Security Accepted ✅",
+                                message=f"Your logbook is held as additional security for Loan #{id}. Continue repayments; it is released when the loan is cleared."))
+    db.session.add(AuditLogPermanent(action="LOAN_SECURITY_HELD", category="loan", member_id=loan.member_id,
+                                     performed_by_id=identity["id"], performed_by_name=identity["name"], performed_by_role=identity["role"],
+                                     details=f"Logbook {loan.security_logbook_no} accepted as security for Loan #{id}"))
+    db.session.commit()
+    return jsonify({"message": "Logbook accepted as security ✓"})
+
+
+@app.route("/loan-applications/<int:id>/security-reject", methods=["PUT"])
+@jwt_required()
+def reject_security_logbook(id):
+    identity = get_jwt_identity()
+    if identity["role"] not in ["hr", "admin", "director"]:
+        return jsonify({"error": "Unauthorized"}), 403
+    loan = LoanApplication.query.get_or_404(id)
+    notes = (request.get_json(silent=True) or {}).get("notes", "Logbook not acceptable, upload a clear copy")
+    loan.security_status = "required"
+    loan.security_notes = notes
+    db.session.add(Notification(recipient_id=loan.member_id, sender_name="SACCO Management", type="loan",
+                                title="Logbook Rejected ❌", message=f"Loan #{id}: {notes}"))
+    db.session.commit()
+    return jsonify({"message": "Logbook rejected, member asked to resubmit"})
+
+
+@app.route("/loan-applications/<int:id>/security-release", methods=["PUT"])
+@jwt_required()
+def release_security_logbook(id):
+    """Manually release the logbook (e.g. loan cleared, handed back to the member)."""
+    identity = get_jwt_identity()
+    if identity["role"] not in ["hr", "admin", "director"]:
+        return jsonify({"error": "Unauthorized"}), 403
+    loan = LoanApplication.query.get_or_404(id)
+    if loan.security_status != "held":
+        return jsonify({"error": "No logbook is currently held for this loan"}), 400
+    loan.security_status = "released"
+    db.session.add(Notification(recipient_id=loan.member_id, sender_name="SACCO Management", type="loan",
+                                title="Logbook Released ✅",
+                                message=f"Your logbook held as security for Loan #{id} has been released."))
+    db.session.add(AuditLogPermanent(action="LOAN_SECURITY_RELEASED", category="loan", member_id=loan.member_id,
+                                     performed_by_id=identity["id"], performed_by_name=identity["name"], performed_by_role=identity["role"],
+                                     details=f"Logbook released for Loan #{id}"))
+    db.session.commit()
+    return jsonify({"message": "Logbook released ✓"})
+
 
 # ================= REPAYMENT ACCOUNT =================
-# 2. Get Repayment Account & Transactions History
-# 1. Get Repayment Account & History (Accessible by Borrower OR HR/Admin)
+# Get Repayment Account & History (Accessible by Borrower OR HR/Admin)
 @app.route("/repayment-account/<int:loan_id>", methods=["GET"])
 @jwt_required()
 def get_repayment_account(loan_id):
     identity = get_jwt_identity()
     account = LoanRepaymentAccount.query.filter_by(loan_id=loan_id).first()
-    
+
     if not account:
         return jsonify({"id": None, "balance": 0.0, "transactions": []})
 
@@ -3860,22 +4353,21 @@ def get_repayment_account(loan_id):
         RepaymentAccountTransaction.created_at.desc()).all()
 
     return jsonify({
-        "id": account.id, 
+        "id": account.id,
         "loan_id": loan_id,
         "balance": account.balance,
         "transactions": [{
-            "id": t.id, 
-            "amount": t.amount, 
+            "id": t.id,
+            "amount": t.amount,
             "transaction_type": t.transaction_type,
-            "description": t.description, 
+            "description": t.description,
             "mpesa_code": t.mpesa_code,
-            "payment_method": t.payment_method, 
+            "payment_method": t.payment_method,
             "date": t.date,
             "status": getattr(t, "status", "approved"),
             "created_at": t.created_at.isoformat() if hasattr(t, "created_at") and t.created_at else ""
         } for t in transactions]
     })
-
 
 
 @app.route("/repayment-account/setup", methods=["POST"])
@@ -3890,7 +4382,8 @@ def setup_repayment_account():
     db.session.commit()
     return jsonify({"message": "Repayment account created", "balance": 0.0}), 201
 
-# 1. Member submits repayment / top-up (Creates PENDING payment - DOES NOT update loan balance yet)
+
+# Member submits repayment / top-up (Creates PENDING payment - DOES NOT update loan balance yet)
 @app.route("/repayment-account/deposit", methods=["POST"])
 @jwt_required()
 def deposit_to_repayment_account():
@@ -3898,14 +4391,13 @@ def deposit_to_repayment_account():
     data = request.get_json()
     loan_id = int(data["loan_id"])
     amount = float(data["amount"])
-    
+
     account = LoanRepaymentAccount.query.filter_by(loan_id=loan_id, member_id=identity["id"]).first()
     if not account:
         account = LoanRepaymentAccount(member_id=identity["id"], loan_id=loan_id, balance=0.0)
         db.session.add(account)
         db.session.commit()
-        
-    # Fixed: Removed 'member_id' argument
+
     txn = RepaymentAccountTransaction(
         account_id=account.id,
         amount=amount,
@@ -3919,26 +4411,25 @@ def deposit_to_repayment_account():
     db.session.add(txn)
     db.session.commit()
     return jsonify({
-        "message": "Top up request submitted for HR/Admin approval", 
+        "message": "Top up request submitted for HR/Admin approval",
         "balance": account.balance
     })
 
 
-
-# 2. HR Approval Endpoint (Updates account balance AND loan.amount_repaid ONLY now)
+# HR Approval Endpoint (Updates account balance AND loan.amount_repaid ONLY now)
 @app.route("/hr/repayment-transactions/<int:id>/approve", methods=["PUT"])
 @jwt_required()
 def approve_repayment_txn(id):
     identity = get_jwt_identity()
     txn = RepaymentAccountTransaction.query.get_or_404(id)
-    
+
     if getattr(txn, "status", None) == "approved":
         return jsonify({"error": "Already approved"}), 400
-        
+
     account = LoanRepaymentAccount.query.get(txn.account_id)
     if account:
         account.balance += txn.amount  # Top up confirmed
-        
+
     txn.status = "approved"
     member_id = account.member_id if account else None
     loan_id = account.loan_id if account else None
@@ -3946,15 +4437,16 @@ def approve_repayment_txn(id):
     if loan_id:
         loan = LoanApplication.query.get(loan_id)
         if loan:
-            loan.amount_repaid += txn.amount  # Decrease total balance
-            
+            loan.amount_repaid += txn.amount
+
             if loan.status in ["approved", "disbursed"]:
                 loan.status = "repaying"
-                
+
             # If prepaying fully, clear the whole loan and mark all steps as paid
             if loan.amount_repaid >= loan.total_payable:
                 loan.status = "cleared"
                 LoanRepaymentSchedule.query.filter_by(loan_id=loan.id).update({"status": "paid"})
+                release_security_if_cleared(loan)  # logbook handed back
             else:
                 # Carry-forward Spillage Logic: Distribute prepayments sequentially
                 remaining_payment = txn.amount
@@ -3975,58 +4467,54 @@ def approve_repayment_txn(id):
                         sched.amount_paid += remaining_payment
                         remaining_payment = 0  # Prepayment fully allocated
 
-            # Record Payment Confirmation Row
-                    payment = LoanPayment(
-                        loan_id=loan.id,
-                        member_id=member_id or loan.member_id,
-                        amount=txn.amount,
-                        payment_method=getattr(txn, "payment_method", "cash") or "cash",
-                        mpesa_code=getattr(txn, "mpesa_code", "") or "",
-                        date=getattr(txn, "date", None) or datetime.now().strftime("%Y-%m-%d")
-                    )
-                    db.session.add(payment)
+            # Record Payment Confirmation Row (once per approval)
+            db.session.add(LoanPayment(
+                loan_id=loan.id,
+                member_id=member_id or loan.member_id,
+                amount=txn.amount,
+                payment_method=getattr(txn, "payment_method", "cash") or "cash",
+                mpesa_code=getattr(txn, "mpesa_code", "") or "",
+                date=getattr(txn, "date", None) or datetime.now().strftime("%Y-%m-%d")
+            ))
 
-                    # --- BOOKKEEPING HOOK B: SPLIT REPAYMENT JOURNAL ---
-                    interest_ratio = (loan.total_payable - loan.amount) / loan.total_payable if loan.total_payable > 0 else 0
-                    interest_portion = round(txn.amount * interest_ratio, 2)
-                    principal_portion = round(txn.amount - interest_portion, 2)
+            # --- BOOKKEEPING HOOK B: SPLIT REPAYMENT JOURNAL ---
+            interest_ratio = (loan.total_payable - loan.amount) / loan.total_payable if loan.total_payable > 0 else 0
+            interest_portion = round(txn.amount * interest_ratio, 2)
+            principal_portion = round(txn.amount - interest_portion, 2)
 
-                    if principal_portion > 0:
-                        record_ledger_entry(
-                            loan_id=loan.id,
-                            member_id=loan.member_id,
-                            transaction_type="repayment_principal",
-                            debit_code="1200",
-                            debit_name="Sacco Cash/Bank Account (Asset)",
-                            credit_code="1300",
-                            credit_name="Loans Receivable Control (Asset)",
-                            amount=principal_portion,
-                            description=f"Approved principal repayment allocation on Loan #{loan.id}",
-                            date=txn.date or datetime.utcnow().strftime("%Y-%m-%d")
-                        )
-                    if interest_portion > 0:
-                        record_ledger_entry(
-                            loan_id=loan.id,
-                            member_id=loan.member_id,
-                            transaction_type="repayment_interest",
-                            debit_code="1200",
-                            debit_name="Sacco Cash/Bank Account (Asset)",
-                            credit_code="4100",
-                            credit_name="Interest Revenue (Income)",
-                            amount=interest_portion,
-                            description=f"Approved interest profit allocation on Loan #{loan.id}",
-                            date=txn.date or datetime.utcnow().strftime("%Y-%m-%d")
-                        )
+            if principal_portion > 0:
+                record_ledger_entry(
+                    loan_id=loan.id,
+                    member_id=loan.member_id,
+                    transaction_type="repayment_principal",
+                    debit_code="1200",
+                    debit_name="Sacco Cash/Bank Account (Asset)",
+                    credit_code="1300",
+                    credit_name="Loans Receivable Control (Asset)",
+                    amount=principal_portion,
+                    description=f"Approved principal repayment allocation on Loan #{loan.id}",
+                    date=txn.date or datetime.utcnow().strftime("%Y-%m-%d")
+                )
+            if interest_portion > 0:
+                record_ledger_entry(
+                    loan_id=loan.id,
+                    member_id=loan.member_id,
+                    transaction_type="repayment_interest",
+                    debit_code="1200",
+                    debit_name="Sacco Cash/Bank Account (Asset)",
+                    credit_code="4100",
+                    credit_name="Interest Revenue (Income)",
+                    amount=interest_portion,
+                    description=f"Approved interest profit allocation on Loan #{loan.id}",
+                    date=txn.date or datetime.utcnow().strftime("%Y-%m-%d")
+                )
 
-                    log_loan = LoanAuditLog(
-                        loan_id=loan.id,
-                        action="PAYMENT_APPROVED",
-                        performed_by=identity["id"],
-                        notes=f"HR approved repayment payment of KES {txn.amount:,.2f}"
-                    )
-                    db.session.add(log_loan)
-
-            # Permanent Audit Log
+            db.session.add(LoanAuditLog(
+                loan_id=loan.id,
+                action="PAYMENT_APPROVED",
+                performed_by=identity["id"],
+                notes=f"HR approved repayment payment of KES {txn.amount:,.2f}"
+            ))
 
     # Permanent Audit Log
     member = Member.query.get(member_id) if member_id else None
@@ -4044,7 +4532,8 @@ def approve_repayment_txn(id):
     db.session.commit()
     return jsonify({"message": "Payment approved & loan balance updated with carry-forward logic ✓"})
 
-# 3. HR Reject Endpoint
+
+# HR Reject Endpoint
 @app.route("/hr/repayment-transactions/<int:id>/reject", methods=["PUT"])
 @jwt_required()
 def reject_repayment_txn(id):
@@ -4070,6 +4559,7 @@ def reject_repayment_txn(id):
     db.session.commit()
     return jsonify({"message": "Payment rejected"})
 
+
 @app.route("/admin/ledger/rebuild", methods=["POST"])
 @jwt_required()
 def rebuild_ledger():
@@ -4087,11 +4577,10 @@ def rebuild_ledger():
         ).all()
         for l in disbursed_loans:
             date_str = l.approved_at.strftime("%Y-%m-%d") if l.approved_at else l.created_at.strftime("%Y-%m-%d") if l.created_at else datetime.utcnow().strftime("%Y-%m-%d")
-            
-            # --- FIX: Fetch the LoanType object cleanly to avoid AttributeError ---
+
             loan_type = LoanType.query.get(l.loan_type_id)
             loan_type_name = loan_type.name if loan_type else "Standard"
-            
+
             entry = LoanLedgerEntry(
                 loan_id=l.id,
                 member_id=l.member_id,
@@ -4105,6 +4594,21 @@ def rebuild_ledger():
                 date=date_str
             )
             db.session.add(entry)
+
+            # 1b. Bank charges recovered before the cheque was issued
+            if (getattr(l, "bank_charges_amount", 0) or 0) > 0 and getattr(l, "bank_charges_ref", None):
+                db.session.add(LoanLedgerEntry(
+                    loan_id=l.id,
+                    member_id=l.member_id,
+                    transaction_type="bank_charges_recovery",
+                    debit_account_code="1200",
+                    debit_account_name="Sacco Cash/Bank Account (Asset)",
+                    credit_account_code="4300",
+                    credit_account_name="Bank Charges Recovery (Income)",
+                    amount=l.bank_charges_amount,
+                    description=f"Bank charges recovered on Loan #{l.id} (ref {l.bank_charges_ref})",
+                    date=date_str
+                ))
 
         # 2. Repayments
         repayments = LoanPayment.query.all()
@@ -4146,9 +4650,9 @@ def rebuild_ledger():
                 )
                 db.session.add(i_entry)
 
-        # 3. Penalty Accruals
-        audit_logs = LoanAuditLog.query.filter(LoanAuditLog.action.in_(["PENALTY_ADDED", "AUTO_DEDUCTION_FAILED"])).all()
-        for log in audit_logs:
+        # 3. Legacy Penalty Accruals (new logbook requests carry no KES amount and are skipped)
+        audit_rows = LoanAuditLog.query.filter(LoanAuditLog.action.in_(["PENALTY_ADDED", "AUTO_DEDUCTION_FAILED"])).all()
+        for log in audit_rows:
             loan = LoanApplication.query.get(log.loan_id)
             if not loan:
                 continue
@@ -4209,7 +4713,8 @@ def rebuild_ledger():
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": f"Reconciliation failed: {str(e)}"}), 500
-    
+
+
 @app.route("/admin/ledger", methods=["GET"])
 @jwt_required()
 def get_admin_ledger():
@@ -4246,6 +4751,7 @@ def get_admin_ledger():
     bal_1350 = sum(e.amount for e in all_entries if e.debit_account_code == "1350") - sum(e.amount for e in all_entries if e.credit_account_code == "1350")
     bal_4100 = sum(e.amount for e in all_entries if e.credit_account_code == "4100")
     bal_4200 = sum(e.amount for e in all_entries if e.credit_account_code == "4200")
+    bal_4300 = sum(e.amount for e in all_entries if e.credit_account_code == "4300")
 
     result_entries = []
     for e in entries:
@@ -4270,181 +4776,136 @@ def get_admin_ledger():
             "1300": bal_1300,
             "1350": bal_1350,
             "4100": bal_4100,
-            "4200": bal_4200
+            "4200": bal_4200,
+            "4300": bal_4300
         }
     }), 200
+
 
 # ================= AUTO DEDUCTION (run via cron or scheduled) =================
 @app.route("/admin/process-deductions", methods=["POST"])
 @jwt_required()
 def process_deductions():
-    """Called daily by a scheduler to auto-deduct loan installments"""
+    """Called daily by a scheduler to auto-deduct loan installments.
+    A missed installment no longer adds a KES penalty: the loan is marked defaulted
+    and the borrower must upload the vehicle logbook as additional security."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    
-    # Find all due installments
-    due_schedules = LoanRepaymentSchedule.query.filter_by(
-        due_date=today, status="pending"
-    ).all()
-    
-    processed = []
-    failed = []
-    
+    due_schedules = LoanRepaymentSchedule.query.filter_by(due_date=today, status="pending").all()
+    processed, failed = [], []
+
     for schedule in due_schedules:
         loan = LoanApplication.query.get(schedule.loan_id)
         if not loan or loan.status not in ["approved", "disbursed", "repaying"]:
             continue
-            
-        account = LoanRepaymentAccount.query.filter_by(member_id=loan.member_id).first()
+
+        account = (LoanRepaymentAccount.query.filter_by(loan_id=loan.id).first()
+                   or LoanRepaymentAccount.query.filter_by(member_id=loan.member_id).first())
         member = Member.query.get(loan.member_id)
-        
+
+        # ── SUCCESS ──
         if account and account.balance >= schedule.amount_due:
-                    # Deduct
-                    account.balance -= schedule.amount_due
-                    schedule.amount_paid += schedule.amount_due
-                    schedule.status = "paid"
-                    schedule.paid_at = datetime.utcnow()
-                    loan.amount_repaid += schedule.amount_due
-                    if loan.status in ["approved", "disbursed"]:
-                        loan.status = "repaying"
-                    if loan.amount_repaid >= loan.total_payable:
-                        loan.status = "cleared"
-                    
-                    txn = RepaymentAccountTransaction(
-                        account_id=account.id,
-                        amount=schedule.amount_due,
-                        transaction_type="deduction",
-                        description=f"Auto-deduction for loan #{loan.id} installment #{schedule.installment_no}",
-                        status="approved"
-                    )
-                    db.session.add(txn)
-                    
-                    payment = LoanPayment(
-                        loan_id=loan.id, member_id=loan.member_id,
-                        amount=schedule.amount_due, payment_method="auto_deduction",
-                        date=today
-                    )
-                    db.session.add(payment)
+            account.balance -= schedule.amount_due
+            schedule.amount_paid += schedule.amount_due
+            schedule.status = "paid"
+            schedule.paid_at = datetime.utcnow()
+            loan.amount_repaid += schedule.amount_due
+            if loan.status in ["approved", "disbursed"]:
+                loan.status = "repaying"
+            if loan.amount_repaid >= loan.total_payable:
+                loan.status = "cleared"
+                release_security_if_cleared(loan)  # logbook can be returned
 
-                    # --- BOOKKEEPING HOOK E1: AUTO-DEDUCTION SUCCESS ---
-                    interest_ratio = (loan.total_payable - loan.amount) / loan.total_payable if loan.total_payable > 0 else 0
-                    interest_portion = round(schedule.amount_due * interest_ratio, 2)
-                    principal_portion = round(schedule.amount_due - interest_portion, 2)
-                    
-                    if principal_portion > 0:
-                        record_ledger_entry(
-                            loan_id=loan.id,
-                            member_id=loan.member_id,
-                            transaction_type="repayment_principal",
-                            debit_code="1200",
-                            debit_name="Sacco Cash/Bank Account (Asset)",
-                            credit_code="1300",
-                            credit_name="Loans Receivable Control (Asset)",
-                            amount=principal_portion,
-                            description=f"Auto-deduction Principal: installment #{schedule.installment_no}",
-                            date=today
-                        )
-                    if interest_portion > 0:
-                        record_ledger_entry(
-                            loan_id=loan.id,
-                            member_id=loan.member_id,
-                            transaction_type="repayment_interest",
-                            debit_code="1200",
-                            debit_name="Sacco Cash/Bank Account (Asset)",
-                            credit_code="4100",
-                            credit_name="Interest Revenue (Income)",
-                            amount=interest_portion,
-                            description=f"Auto-deduction Interest: installment #{schedule.installment_no}",
-                            date=today
-                        )
+            db.session.add(RepaymentAccountTransaction(
+                account_id=account.id, amount=schedule.amount_due, transaction_type="deduction",
+                description=f"Auto-deduction for loan #{loan.id} installment #{schedule.installment_no}",
+                status="approved"))
+            db.session.add(LoanPayment(loan_id=loan.id, member_id=loan.member_id,
+                                       amount=schedule.amount_due, payment_method="auto_deduction", date=today))
 
-                    processed.append(loan.id)
-                    
-                    # Send success SMS/email
-        if member and member.phone:
-                        try:
-                            sms.send(
-                                f"✅ KES {schedule.amount_due} deducted from your repayment account for Loan #{loan.id}. Balance: KES {account.balance}",
-                                [member.phone]
-                            )
-                        except Exception as e:
-                            print("SMS error:", e)
-        else:
-                    # Insufficient balance - add penalty and notify
-                    penalty_amount = schedule.amount_due * 0.05  # 5% penalty
-                    loan.penalty += penalty_amount
-                    loan.total_payable += penalty_amount
-                    loan.status = "defaulted"
-                    schedule.status = "overdue"
-                    
-                    db.session.add(LoanAuditLog(
-                        loan_id=loan.id, action="AUTO_DEDUCTION_FAILED",
-                        performed_by=1,
-                        notes=f"Insufficient balance. Penalty KES {penalty_amount} applied."
-                    ))
+            ratio = (loan.total_payable - loan.amount) / loan.total_payable if loan.total_payable > 0 else 0
+            interest = round(schedule.amount_due * ratio, 2)
+            principal = round(schedule.amount_due - interest, 2)
+            if principal > 0:
+                record_ledger_entry(loan_id=loan.id, member_id=loan.member_id,
+                                    transaction_type="repayment_principal",
+                                    debit_code="1200", debit_name="Sacco Cash/Bank Account (Asset)",
+                                    credit_code="1300", credit_name="Loans Receivable Control (Asset)",
+                                    amount=principal, description=f"Auto-deduction Principal: installment #{schedule.installment_no}",
+                                    date=today)
+            if interest > 0:
+                record_ledger_entry(loan_id=loan.id, member_id=loan.member_id,
+                                    transaction_type="repayment_interest",
+                                    debit_code="1200", debit_name="Sacco Cash/Bank Account (Asset)",
+                                    credit_code="4100", credit_name="Interest Revenue (Income)",
+                                    amount=interest, description=f"Auto-deduction Interest: installment #{schedule.installment_no}",
+                                    date=today)
+            processed.append(loan.id)
 
-                    # --- BOOKKEEPING HOOK E2: AUTO-APPLIED PENALTY ---
-                    record_ledger_entry(
-                        loan_id=loan.id,
-                        member_id=loan.member_id,
-                        transaction_type="penalty_accrual",
-                        debit_code="1350",
-                        debit_name="Penalties Receivable (Asset)",
-                        credit_code="4200",
-                        credit_name="Penalty Revenue (Income)",
-                        amount=penalty_amount,
-                        description=f"Auto-applied 5% default penalty on Loan #{loan.id} installment #{schedule.installment_no}",
-                        date=today
-                    )
-
-                    failed.append(loan.id)
-            
-            # Notify member and guarantors
-        if member and member.phone:
+            if member and member.phone and sms:
                 try:
-                    sms.send(
-                        f"⚠️ URGENT: Your loan repayment of KES {schedule.amount_due} for Loan #{loan.id} is due today but your repayment account has insufficient funds (Balance: KES {account.balance if account else 0}). A penalty of KES {penalty_amount} has been applied. Top up immediately.",
-                        [member.phone]
-                    )
+                    sms.send(f"✅ KES {schedule.amount_due} deducted for Loan #{loan.id}. Balance: KES {account.balance}",
+                             [member.phone])
                 except Exception as e:
                     print("SMS error:", e)
-            
-            # Notify guarantors
-        guarantors = LoanGuarantor.query.filter_by(loan_id=loan.id, status="accepted").all()
-        for g in guarantors:
-                guarantor = Member.query.get(g.guarantor_id)
-                if guarantor and guarantor.phone:
-                    try:
-                        sms.send(
-                            f"⚠️ NOTICE: {member.name} (Loan #{loan.id}) has missed a repayment of KES {schedule.amount_due}. As guarantor you may be liable.",
-                            [guarantor.phone]
-                        )
-                    except Exception as e:
-                        print("SMS error:", e)
-    
+            continue
+
+        # ── FAILURE: no money penalty, request logbook as additional security ──
+        schedule.status = "overdue"
+        loan.status = "defaulted"
+        if (getattr(loan, "security_status", "none") or "none") in ("none", "rejected", "released"):
+            loan.security_status = "required"
+
+        db.session.add(LoanAuditLog(
+            loan_id=loan.id, action="AUTO_DEDUCTION_FAILED", performed_by=1,
+            notes=f"Missed installment #{schedule.installment_no} (KES {schedule.amount_due}). Logbook security requested."))
+        db.session.add(Notification(
+            recipient_id=loan.member_id, sender_name="SACCO System", type="loan",
+            title="Missed Repayment – Upload Logbook ⚠️",
+            message=(f"Installment #{schedule.installment_no} of KES {schedule.amount_due:,.0f} on Loan #{loan.id} "
+                     f"was missed. Please upload your vehicle logbook as additional security and top up your repayment account.")))
+        failed.append(loan.id)
+
+        if member and member.phone and sms:
+            try:
+                sms.send(f"⚠️ URGENT: Loan #{loan.id} installment of KES {schedule.amount_due} was not paid. "
+                         f"Upload your logbook as additional security and top up immediately.", [member.phone])
+            except Exception as e:
+                print("SMS error:", e)
+
+        for g in LoanGuarantor.query.filter_by(loan_id=loan.id, status="accepted").all():
+            gm = Member.query.get(g.guarantor_id)
+            if gm and gm.phone and sms and member:
+                try:
+                    sms.send(f"⚠️ NOTICE: {member.name} (Loan #{loan.id}) missed a repayment of KES {schedule.amount_due}. "
+                             f"As guarantor you may be liable.", [gm.phone])
+                except Exception as e:
+                    print("SMS error:", e)
+
     db.session.commit()
     return jsonify({"processed": processed, "failed": failed, "date": today})
+
 
 # ================= SEND REMINDERS =================
 @app.route("/admin/send-reminders", methods=["POST"])
 @jwt_required()
 def send_reminders():
     """Send reminders 3 days before due date"""
-    from datetime import timedelta
     reminder_date = (datetime.utcnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-    
+
     upcoming = LoanRepaymentSchedule.query.filter_by(
         due_date=reminder_date, status="pending"
     ).all()
-    
+
     sent = 0
     for schedule in upcoming:
         loan = LoanApplication.query.get(schedule.loan_id)
-        if not loan: continue
+        if not loan:
+            continue
         member = Member.query.get(loan.member_id)
         account = LoanRepaymentAccount.query.filter_by(member_id=loan.member_id).first()
         balance = account.balance if account else 0
-        
-        if member and member.phone:
+
+        if member and member.phone and sms:
             try:
                 sms.send(
                     f"📅 REMINDER: Your loan installment of KES {schedule.amount_due} for Loan #{loan.id} is due on {schedule.due_date}. Your repayment account balance is KES {balance}. {'✅ Sufficient funds' if balance >= schedule.amount_due else '⚠️ Please top up!'}",
@@ -4453,8 +4914,9 @@ def send_reminders():
                 sent += 1
             except Exception as e:
                 print("SMS error:", e)
-    
+
     return jsonify({"reminders_sent": sent, "reminder_date": reminder_date})
+
 
 # ================= ADMIN STATS =================
 @app.route("/admin/stats", methods=["GET"])
@@ -4464,36 +4926,59 @@ def admin_stats():
     total_matatus = Matatu.query.count()
     total_loans = LoanApplication.query.count()
     active_loans = LoanApplication.query.filter(
-        LoanApplication.status.in_(["approved", "disbursed", "repaying"])
+        LoanApplication.status.in_(["approved", "requirements_pending", "disbursed", "repaying"])
     ).count()
     total_routes = Route.query.filter_by(is_active=True).count()
     total_receipts = Receipt.query.filter_by(is_submitted=True).count()
-    total_savings = db.session.query(db.func.sum(Saving.amount)).filter_by(
-        transaction_type="deposit"
-    ).scalar() or 0
     pending_loans = LoanApplication.query.filter_by(status="pending").count()
+    awaiting_requirements = LoanApplication.query.filter_by(status="requirements_pending").count()
+    security_pending = LoanApplication.query.filter_by(security_status="pending_approval").count()
+
+    approved_rows = Saving.query.filter(approved_filter()).all()
+
+    def net(rows):
+        return sum(s.amount if s.transaction_type == "deposit" else -s.amount for s in rows)
+
+    personal_savings = net([s for s in approved_rows if s.matatu_id is None])
+    matatu_savings = net([s for s in approved_rows if s.matatu_id is not None])
+    pending_savings = Saving.query.filter(Saving.status.in_(["pending_hr", "pending_admin"])).count()
+
     return jsonify({
         "total_members": total_members, "total_matatus": total_matatus,
         "total_loans": total_loans, "active_loans": active_loans,
         "total_routes": total_routes, "total_receipts": total_receipts,
-        "total_savings": total_savings, "pending_loans": pending_loans
+        "total_savings": personal_savings,      # personal, approved only
+        "matatu_savings": matatu_savings,       # matatu accounts, approved only
+        "pending_savings": pending_savings,
+        "pending_loans": pending_loans,
+        "awaiting_requirements": awaiting_requirements,
+        "security_pending": security_pending
     })
+
 
 # Admin see all savings
 @app.route("/admin/savings", methods=["GET"])
 @jwt_required()
 def admin_get_all_savings():
+    identity = get_jwt_identity()
+    if identity["role"] not in ["admin", "director", "hr"]:
+        return jsonify({"error": "Unauthorized"}), 403
     savings = Saving.query.order_by(Saving.created_at.desc()).all()
     result = []
     for s in savings:
         member = Member.query.get(s.member_id)
+        matatu = Matatu.query.get(s.matatu_id) if s.matatu_id else None
         result.append({
             "id": s.id, "member_name": member.name if member else "",
             "membership_no": member.membership_no if member else "",
             "amount": s.amount, "transaction_type": s.transaction_type,
-            "description": s.description, "date": s.date, "matatu_id": s.matatu_id
+            "description": s.description, "date": s.date,
+            "matatu_id": s.matatu_id, "plate": matatu.plate if matatu else None,
+            "status": getattr(s, "status", None) or "approved"
         })
     return jsonify(result)
+
+
 # ================= RECEIPTS BY ROUTE PER DAY =================
 @app.route("/receipts/by-route", methods=["GET"])
 @jwt_required()
@@ -4545,6 +5030,8 @@ def receipts_by_route():
         "grand_total": sum(r.shimo_fee for r in receipts),
         "total_tickets": len(receipts)
     })
+
+
 # ================= ROUTES LIST (for filter dropdown) =================
 @app.route("/receipts/route-list", methods=["GET"])
 @jwt_required()
@@ -4562,6 +5049,8 @@ def receipt_route_list():
                 "label": f"{r.from_stage} → {r.to_stage}"
             }
     return jsonify(list(seen.values()))
+
+
 # ================= SALARY CONFIG =================
 @app.route("/salary/config", methods=["GET"])
 @jwt_required()
@@ -4588,6 +5077,8 @@ def get_salary_configs():
             "last_period": last.period if last else None
         })
     return jsonify(result)
+
+
 @app.route("/salary/config", methods=["POST"])
 @jwt_required()
 def create_salary_config():
@@ -4623,6 +5114,8 @@ def create_salary_config():
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Salary config created", "id": config.id}), 201
+
+
 @app.route("/salary/config/<int:id>", methods=["PUT"])
 @jwt_required()
 def update_salary_config(id):
@@ -4634,13 +5127,15 @@ def update_salary_config(id):
     config.is_active = data.get("is_active", config.is_active)
     db.session.commit()
     return jsonify({"message": "Updated"})
+
+
 # ================= SALARY PAYMENTS =================
 @app.route("/salary/pay", methods=["POST"])
 @jwt_required()
 def pay_salary():
     identity = get_jwt_identity()
     data = request.get_json()
-    
+
     # HR initiates as "pending_approval", while Admin/Director immediately "approved"
     initial_status = "pending_approval"
     if identity["role"] in ["admin", "director"]:
@@ -4661,7 +5156,7 @@ def pay_salary():
     db.session.commit()
 
     member = Member.query.get(data["member_id"])
-    
+
     action_label = "SALARY_INITIATED" if initial_status == "pending_approval" else "SALARY_PAID"
     log = AuditLogPermanent(
         action=action_label,
@@ -4680,13 +5175,14 @@ def pay_salary():
     if initial_status == "approved" and member and member.phone:
         try:
             sms.send(
-                f"✅ Salary Payment: KES {data['amount']} for period {data['period']} has been disbursed via {data.get('payment_method','cash')}. - SACCO HR",
+                f"✅ Salary Payment: KES {data['amount']} for period {data['period']} has been disbursed via {data.get('payment_method', 'cash')}. - SACCO HR",
                 [member.phone]
             )
         except Exception as e:
             print("SMS error:", e)
 
     return jsonify({"message": f"Salary payment {initial_status}", "id": payment.id, "status": initial_status}), 201
+
 
 @app.route("/salary/payments", methods=["GET"])
 @jwt_required()
@@ -4710,10 +5206,12 @@ def get_salary_payments():
             "payment_method": p.payment_method,
             "mpesa_code": p.mpesa_code,
             "notes": p.notes,
-            "status": getattr(p, "status", "approved") or "approved", # Default to approved for legacy data
+            "status": getattr(p, "status", "approved") or "approved",  # Default to approved for legacy data
             "created_at": p.created_at.isoformat()
         })
     return jsonify(result)
+
+
 # ================= ADMIN: TWO-TIER SALARY APPROVALS =================
 @app.route("/salary/payments/<int:id>/approve", methods=["PUT"])
 @jwt_required()
@@ -4721,14 +5219,14 @@ def approve_salary_payment(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Only Administrators or Directors can authorize initiated salary payments"}), 403
-        
+
     payment = SalaryPayment.query.get_or_404(id)
     if getattr(payment, "status", "approved") == "approved":
         return jsonify({"error": "This salary payment has already been authorized"}), 400
-        
+
     payment.status = "approved"
     db.session.commit()
-    
+
     member = Member.query.get(payment.member_id)
     if member and member.phone:
         try:
@@ -4738,7 +5236,7 @@ def approve_salary_payment(id):
             )
         except Exception as e:
             print("SMS error:", e)
-            
+
     log = AuditLogPermanent(
         action="SALARY_PAYMENT_APPROVED",
         category="worker",
@@ -4751,7 +5249,7 @@ def approve_salary_payment(id):
     )
     db.session.add(log)
     db.session.commit()
-    
+
     return jsonify({"message": "Salary payment approved and disbursed successfully", "status": "approved"}), 200
 
 
@@ -4761,14 +5259,14 @@ def reject_salary_payment(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["admin", "director"]:
         return jsonify({"error": "Only Administrators or Directors can reject initiated salary payments"}), 403
-        
+
     payment = SalaryPayment.query.get_or_404(id)
     if getattr(payment, "status", "approved") == "approved":
         return jsonify({"error": "Disbursed and approved payments cannot be rejected"}), 400
-        
+
     payment.status = "rejected"
     db.session.commit()
-    
+
     member = Member.query.get(payment.member_id)
     log = AuditLogPermanent(
         action="SALARY_PAYMENT_REJECTED",
@@ -4782,8 +5280,9 @@ def reject_salary_payment(id):
     )
     db.session.add(log)
     db.session.commit()
-    
+
     return jsonify({"message": "Salary payment rejected", "status": "rejected"}), 200
+
 
 @app.route("/salary/payments/my", methods=["GET"])
 @jwt_required()
@@ -4795,6 +5294,7 @@ def get_my_salary():
         "period": p.period, "payment_method": p.payment_method,
         "notes": p.notes, "created_at": p.created_at.isoformat()
     } for p in payments])
+
 
 # ================= WORKER WARNINGS =================
 @app.route("/workers/warnings", methods=["POST"])
@@ -4811,7 +5311,7 @@ def issue_warning():
     db.session.add(warning)
     member = Member.query.get(data["member_id"])
     log = AuditLogPermanent(
-        action=f"WARNING_{data.get('severity','minor').upper()}_ISSUED",
+        action=f"WARNING_{data.get('severity', 'minor').upper()}_ISSUED",
         category="worker",
         member_id=data["member_id"],
         membership_no=member.membership_no if member else "",
@@ -4832,6 +5332,8 @@ def issue_warning():
         except Exception as e:
             print("SMS error:", e)
     return jsonify({"message": "Warning issued", "id": warning.id}), 201
+
+
 @app.route("/workers/warnings/all", methods=["GET"])
 @jwt_required()
 def get_all_warnings():
@@ -4854,6 +5356,8 @@ def get_all_warnings():
             "created_at": w.created_at.isoformat()
         })
     return jsonify(result)
+
+
 @app.route("/workers/warnings/<int:member_id>/member", methods=["GET"])
 @jwt_required()
 def get_member_warnings(member_id):
@@ -4868,6 +5372,8 @@ def get_member_warnings(member_id):
             "created_at": w.created_at.isoformat()
         })
     return jsonify(result)
+
+
 @app.route("/workers/warnings/<int:id>/acknowledge", methods=["PUT"])
 @jwt_required()
 def acknowledge_warning(id):
@@ -4876,6 +5382,8 @@ def acknowledge_warning(id):
     w.acknowledged_at = datetime.utcnow()
     db.session.commit()
     return jsonify({"message": "Warning acknowledged"})
+
+
 # ================= WORKER PERFORMANCE SUMMARY =================
 @app.route("/workers/summary/<int:member_id>", methods=["GET"])
 @jwt_required()
@@ -4903,7 +5411,7 @@ def worker_summary(member_id):
             "warnings_unacknowledged": sum(1 for w in warnings if not w.is_acknowledged),
             "salary_payments": len(salary_payments),
             "total_salary_paid": sum(p.amount for p in salary_payments),
-            "active_loans": sum(1 for l in loans if l.status in ["approved", "disbursed", "repaying"])
+            "active_loans": sum(1 for l in loans if l.status in ["approved", "requirements_pending", "disbursed", "repaying"])
         },
         "salary_config": {
             "base_salary": config.base_salary if config else 0,
@@ -4920,19 +5428,23 @@ def worker_summary(member_id):
             "created_at": w.created_at.isoformat()
         } for w in warnings[:5]]
     })
+
+
 # ================= ADMIN: DELETE LOAN TYPE =================
 @app.route("/loan-types/<int:id>", methods=["DELETE"])
 @jwt_required()
 def delete_loan_type(id):
     lt = LoanType.query.get_or_404(id)
     active = LoanApplication.query.filter_by(loan_type_id=id).filter(
-        LoanApplication.status.in_(["pending", "guarantors_pending", "approved", "disbursed", "repaying"])
+        LoanApplication.status.in_(["pending", "guarantors_pending", "approved", "requirements_pending", "disbursed", "repaying"])
     ).count()
     if active > 0:
         return jsonify({"error": f"Cannot delete: {active} active loan(s) use this type"}), 400
     db.session.delete(lt)
     db.session.commit()
     return jsonify({"message": "Loan type deleted"})
+
+
 # ================= ADMIN: DELETE RECEIPT =================
 @app.route("/receipts/<int:id>", methods=["DELETE"])
 @jwt_required()
@@ -4952,6 +5464,8 @@ def delete_receipt(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Receipt deleted"})
+
+
 @app.route("/receipts/summary", methods=["GET"])
 @jwt_required()
 def daily_summary():
@@ -4971,6 +5485,8 @@ def daily_summary():
         by_route[key]["total"] += r.shimo_fee
     return jsonify({"date": date_filter, "total_tickets": len(receipts),
                     "total_amount": total, "by_route": by_route})
+
+
 # ================= HR: SEND LOAN REMINDER =================
 @app.route("/loans/send-reminder/<int:id>", methods=["POST"])
 @jwt_required()
@@ -4998,26 +5514,28 @@ def send_loan_reminder(id):
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": "Reminder sent"})
+
+
 # ================= ADMIN: DELETE LOAN APPLICATION =================
 @app.route("/loan-applications/<int:id>/delete", methods=["DELETE"])
 @jwt_required()
 def delete_loan_application(id):
     identity = get_jwt_identity()
     loan = LoanApplication.query.get_or_404(id)
-    
+
     # Only allow deletion of non-active loans
     safe_statuses = ["pending", "guarantors_pending", "rejected", "guarantor_rejected", "info_required"]
     if loan.status not in safe_statuses:
         return jsonify({"error": f"Cannot delete a loan with status '{loan.status}'. Only pending/rejected loans can be deleted."}), 400
-    
+
     # Delete related records first (cascade)
     LoanGuarantor.query.filter_by(loan_id=id).delete()
     LoanAuditLog.query.filter_by(loan_id=id).delete()
     LoanRepaymentSchedule.query.filter_by(loan_id=id).delete()
     LoanRepaymentAccount.query.filter_by(loan_id=id).delete()
-    
+
     db.session.delete(loan)
-    
+
     # Log it
     log = AuditLogPermanent(
         action="LOAN_APPLICATION_DELETED",
@@ -5031,6 +5549,7 @@ def delete_loan_application(id):
     db.session.commit()
     return jsonify({"message": f"Loan #{id} deleted successfully"})
 
+
 # Assign route to matatu
 @app.route("/matatus/<int:id>/assign-route", methods=["PUT"])
 @jwt_required()
@@ -5040,6 +5559,7 @@ def assign_route_to_matatu(id):
     matatu.route_id = data["route_id"]
     db.session.commit()
     return jsonify({"message": "Route assigned"})
+
 
 # Matatu daily records (earnings+expenditures+savings for a date, shared between driver & conductor)
 @app.route("/matatu/daily-records", methods=["GET"])
@@ -5053,7 +5573,7 @@ def get_matatu_daily_records():
 
     earnings = DailyEarning.query.filter_by(matatu_id=matatu_id)
     expenditures = Expenditure.query.filter_by(matatu_id=matatu_id)
-    savings = Saving.query.filter_by(matatu_id=matatu_id)
+    savings = Saving.query.filter_by(matatu_id=matatu_id).filter(approved_filter())
 
     if date_filter:
         earnings = earnings.filter_by(date=date_filter)
@@ -5082,9 +5602,10 @@ def get_matatu_daily_records():
         "totals": {
             "earnings": sum(e.amount for e in earnings),
             "expenditures": sum(e.amount for e in expenditures),
-            "savings": sum(s.amount for s in savings if s.transaction_type=="deposit") - sum(s.amount for s in savings if s.transaction_type=="withdrawal")
+            "savings": sum(s.amount for s in savings if s.transaction_type == "deposit") - sum(s.amount for s in savings if s.transaction_type == "withdrawal")
         }
     })
+
 
 # Owner: records per matatu per date (all submissions from any crew)
 @app.route("/owner/matatu-records", methods=["GET"])
@@ -5092,6 +5613,8 @@ def get_matatu_daily_records():
 def owner_matatu_records():
     identity = get_jwt_identity()
     matatu_id = request.args.get("matatu_id")
+    if identity["role"] not in ("admin", "director", "hr") and int(matatu_id) not in allowed_matatu_ids(identity):
+        return jsonify({"error": "Unauthorized"}), 403
     date_filter = request.args.get("date")
 
     # Verify ownership
@@ -5101,7 +5624,7 @@ def owner_matatu_records():
 
     earnings = DailyEarning.query.filter_by(matatu_id=matatu_id)
     expenditures = Expenditure.query.filter_by(matatu_id=matatu_id)
-    savings = Saving.query.filter_by(matatu_id=matatu_id)
+    savings = Saving.query.filter_by(matatu_id=matatu_id).filter(approved_filter())
 
     if date_filter:
         earnings = earnings.filter_by(date=date_filter)
@@ -5131,9 +5654,10 @@ def owner_matatu_records():
         "totals": {
             "earnings": sum(e.amount for e in earnings),
             "expenditures": sum(e.amount for e in expenditures),
-            "savings_balance": sum(s.amount for s in savings if s.transaction_type=="deposit") - sum(s.amount for s in savings if s.transaction_type=="withdrawal")
+            "savings_balance": sum(s.amount for s in savings if s.transaction_type == "deposit") - sum(s.amount for s in savings if s.transaction_type == "withdrawal")
         }
     })
+
 
 # Guarantor history (accepted + rejected, not just pending)
 @app.route("/guarantors/my-history", methods=["GET"])
@@ -5163,18 +5687,22 @@ def get_my_guarantor_history():
     result.sort(key=lambda x: (x["status"] != "pending", x["created_at"]), reverse=False)
     return jsonify(result)
 
+
 # ── Loan type: terms & conditions upload ──
 @app.route("/loan-types/<int:id>/terms", methods=["PUT"])
 @jwt_required()
 def upload_loan_type_terms(id):
     lt = LoanType.query.get_or_404(id)
     file = request.files.get("terms_file")
-    if not file: return jsonify({"error": "No file"}), 400
+    if not file:
+        return jsonify({"error": "No file"}), 400
     file_type = file.content_type or ""
     upload = cloudinary.uploader.upload(file, resource_type="raw" if "image" not in file_type else "image")
     lt.terms_file = upload["secure_url"]
     db.session.commit()
     return jsonify({"message": "Terms uploaded", "url": lt.terms_file})
+
+
 # ── Loan disbursement proof ──
 @app.route("/loan-applications/<int:id>/disburse-proof", methods=["POST"])
 @jwt_required()
@@ -5186,7 +5714,7 @@ def upload_disburse_proof(id):
         file_type = file.content_type or ""
         upload = cloudinary.uploader.upload(file, resource_type="image" if "image" in file_type else "raw")
         loan.disburse_proof = upload["secure_url"]
-        loan.disburse_note = request.form.get("note","")
+        loan.disburse_note = request.form.get("note", "")
         db.session.commit()
     log = AuditLogPermanent(
         action="DISBURSE_PROOF_UPLOADED", category="loan",
@@ -5198,34 +5726,20 @@ def upload_disburse_proof(id):
     db.session.commit()
     return jsonify({"message": "Proof uploaded", "disburse_proof": loan.disburse_proof})
 
-# ── Borrower responds to info_required ──
-# @app.route("/loan-applications/<int:id>/respond-info", methods=["PUT"])
-# @jwt_required()
-# def respond_to_info_request(id):
-#     identity = get_jwt_identity()
-#     loan = LoanApplication.query.get_or_404(id)
-#     if loan.member_id != identity["id"]:
-#         return jsonify({"error": "Unauthorized"}), 403
-#     data = request.get_json()
-#     loan.borrower_response = data.get("response","")
-#     loan.status = "pending"  # re-submit for review
-#     log = LoanAuditLog(loan_id=id, action="BORROWER_INFO_SUBMITTED",
-#                        performed_by=identity["id"], notes=data.get("response",""))
-#     db.session.add(log)
-#     db.session.commit()
-#     return jsonify({"message": "Response submitted, loan back under review"})
 
-# ── Penalties by loan type ──
+# ── Penalty policy per loan type (legacy – retained so existing screens keep working) ──
 @app.route("/loan-types/<int:id>/penalty-policy", methods=["PUT"])
 @jwt_required()
 def update_penalty_policy(id):
     lt = LoanType.query.get_or_404(id)
     data = request.get_json()
-    lt.penalty_rate = data.get("penalty_rate", lt.penalty_rate)  # % per missed payment
+    lt.penalty_rate = data.get("penalty_rate", lt.penalty_rate)
     lt.grace_period_days = data.get("grace_period_days", lt.grace_period_days)
     lt.penalty_description = data.get("penalty_description", "")
     db.session.commit()
     return jsonify({"message": "Penalty policy updated"})
+
+
 @app.route("/loan-types/<int:id>/penalty-policy", methods=["POST"])
 @jwt_required()
 def set_penalty_policy(id):
@@ -5236,12 +5750,14 @@ def set_penalty_policy(id):
     lt.penalty_description = data.get("penalty_description", "")
     db.session.commit()
     return jsonify({"message": "Penalty policy saved"})
+
+
 # ================= MEMBER FINANCIAL STATEMENT / PAYMENT TRACKER =================
 @app.route("/members/<int:member_id>/statement", methods=["GET"])
 @jwt_required()
 def get_member_statement(member_id):
     identity = get_jwt_identity()
-    
+
     # Security Check: Allow HR/Director/Admin OR the member themselves
     if identity["role"] not in ["hr", "director", "admin"] and identity["id"] != member_id:
         return jsonify({"error": "Unauthorized"}), 403
@@ -5333,7 +5849,7 @@ def get_member_statement(member_id):
         "statement": statement
     })
 
-# ================= STAGE OPERATOR & VEHICLE PERFORMANCE =================
+
 # ================= MEMBERS FALLBACK ROUTE =================
 @app.route("/members", methods=["GET"])
 @jwt_required()
@@ -5343,30 +5859,30 @@ def get_all_active_members():
         "id": m.id,
         "name": m.name,
         "membership_no": m.membership_no,
-        "national_id": m.national_id,  # ✅ ADD THIS LINE
+        "national_id": m.national_id,
         "phone": m.phone,
         "role": m.role,
         "is_active": m.is_active
     } for m in members])
 
-# ================= STAGE OPERATOR & COMPLIANCE ROUTES =================
 
+# ================= STAGE OPERATOR & COMPLIANCE ROUTES =================
 @app.route("/receipts/check-vehicle-trips", methods=["GET"])
 @jwt_required()
 def check_vehicle_trips():
     plate = request.args.get("plate", "").strip().upper()
     date_filter = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
-    
+
     if not plate:
         return jsonify({"error": "Plate number required"}), 400
-        
+
     # Case-insensitive and trimmed lookup for submitted receipts today
     receipts = Receipt.query.filter(
         db.func.upper(db.func.trim(Receipt.plate)) == plate,
         Receipt.date_issued == date_filter,
         Receipt.is_submitted == True
     ).all()
-    
+
     return jsonify({
         "plate": plate,
         "date": date_filter,
@@ -5374,13 +5890,14 @@ def check_vehicle_trips():
         "is_first_trip": len(receipts) == 0
     })
 
+
 @app.route("/stage/penalties-all", methods=["GET"])
 @jwt_required()
 def get_all_stage_penalties():
     penalties = PenaltyLog.query.order_by(PenaltyLog.created_at.desc()).all()
     result = []
     now = datetime.utcnow()
-    
+
     for p in penalties:
         remaining_days = 0
         if p.action_type == "Suspend" and not p.is_lifted and p.suspension_started_at:
@@ -5388,7 +5905,7 @@ def get_all_stage_penalties():
             elapsed_hours = (now - p.suspension_started_at).total_seconds() / 3600
             days_passed = int(elapsed_hours // 24)
             remaining_days = max(0, p.suspension_days - days_passed)
-            
+
             # Auto-lift if countdown hits 0
             if remaining_days == 0:
                 p.is_lifted = True
@@ -5406,14 +5923,15 @@ def get_all_stage_penalties():
             "mistake": p.mistake,
             "action_type": p.action_type,
             "amount_paid": p.amount_paid,
-            "suspension_days": p.suspension_days, # Original action token
-            "remaining_days": remaining_days,       # Dynamic 24h countdown
+            "suspension_days": p.suspension_days,  # Original action token
+            "remaining_days": remaining_days,      # Dynamic 24h countdown
             "is_lifted": p.is_lifted,
             "date": p.date,
             "created_at": p.created_at.isoformat() if p.created_at else ""
         })
-        
+
     return jsonify(result)
+
 
 @app.route("/stage/check-trip", methods=["GET"])
 @jwt_required()
@@ -5428,6 +5946,7 @@ def stage_check_trip():
         "is_first_trip": len(receipts) == 0
     })
 
+
 @app.route("/stage/delivery-summary", methods=["GET"])
 @jwt_required()
 def stage_delivery_summary():
@@ -5441,13 +5960,13 @@ def stage_delivery_summary():
             by_route[route_key] = {"count": 0, "total": 0.0}
         by_route[route_key]["count"] += 1
         by_route[route_key]["total"] += r.shimo_fee
-        
+
         plate = r.plate or "UNKNOWN"
         if plate not in vehicle_map:
             vehicle_map[plate] = {"plate": plate, "trips_count": 0, "amount_collected": 0.0}
         vehicle_map[plate]["trips_count"] += 1
         vehicle_map[plate]["amount_collected"] += r.shimo_fee
-        
+
     return jsonify({
         "date": date_filter,
         "total_vehicles": len(vehicle_map),
@@ -5457,22 +5976,23 @@ def stage_delivery_summary():
         "vehicles": list(vehicle_map.values())
     })
 
+
 @app.route("/stage/vehicle-performance", methods=["GET"])
 @jwt_required()
 def stage_vehicle_performance():
     """Fetches comprehensive trip performance, receipts, and delivery fees for a plate & date"""
     plate = request.args.get("plate", "").strip().upper()
-    date_filter = request.args.get("date") # Optional date filter
-    
+    date_filter = request.args.get("date")  # Optional date filter
+
     if not plate:
         return jsonify({"error": "Plate is required"}), 400
-        
+
     query = Receipt.query.filter_by(plate=plate, is_submitted=True)
     if date_filter:
         query = query.filter_by(date_issued=date_filter)
-        
+
     receipts = query.order_by(Receipt.date_issued.desc(), Receipt.time_issued.desc()).all()
-    
+
     return jsonify({
         "plate": plate,
         "date_filtered": date_filter or "All Time",
@@ -5488,6 +6008,7 @@ def stage_vehicle_performance():
             "time_issued": r.time_issued
         } for r in receipts]
     })
+
 
 @app.route("/stage/expenses", methods=["POST"])
 @jwt_required()
@@ -5505,6 +6026,7 @@ def record_stage_expense():
     db.session.commit()
     return jsonify({"message": "Expense recorded successfully", "id": expense.id}), 201
 
+
 @app.route("/stage/penalties", methods=["POST"])
 @jwt_required()
 def record_stage_penalty():
@@ -5513,7 +6035,7 @@ def record_stage_penalty():
     action_type = data.get("action_type")
     suspension_days = int(data.get("suspension_days") or 0)
     mistake = data.get("mistake")
-    
+
     penalty = PenaltyLog(
         member_id=member_id,
         member_name=data.get("member_name"),
@@ -5522,22 +6044,21 @@ def record_stage_penalty():
         mistake=mistake,
         action_type=action_type,
         amount_paid=float(data.get("amount_paid") or 0),
-        suspension_days=suspension_days, # Original Action Taken preserved
+        suspension_days=suspension_days,  # Original Action Taken preserved
         suspension_started_at=datetime.utcnow(),
         is_lifted=False,
         date=data.get("date", datetime.now().strftime("%Y-%m-%d"))
     )
     db.session.add(penalty)
-    
+
     if action_type == "Suspend":
         member = Member.query.get(member_id)
         if member:
             member.is_suspended = True
             member.suspension_reason = f"Suspended for {suspension_days} day(s). Reason: {mistake}"
-            
+
     db.session.commit()
     return jsonify({"message": "Penalty logged successfully", "id": penalty.id}), 201
-
 
 
 @app.route("/hr/members/<int:id>/lift-suspension", methods=["PUT"])
@@ -5546,19 +6067,15 @@ def lift_suspension(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     member = Member.query.get_or_404(id)
     member.is_suspended = False
     member.suspension_reason = None
-    db.session.commit()
 
-      # Mark penalty log as lifted
+    # Mark penalty log as lifted
     penalties = PenaltyLog.query.filter_by(member_id=id, is_lifted=False).all()
     for p in penalties:
         p.is_lifted = True
-        
-    db.session.commit()
-    return jsonify({"message": f"Suspension lifted for {member.name} ✓"})
 
     # Log permanently
     log = AuditLogPermanent(
@@ -5573,23 +6090,26 @@ def lift_suspension(id):
     )
     db.session.add(log)
     db.session.commit()
-    
+
     return jsonify({"message": f"Suspension lifted for {member.name} ✓"})
+
+
 @app.route("/stage/penalties/<int:id>", methods=["DELETE"])
 @jwt_required()
 def delete_lifted_penalty(id):
     identity = get_jwt_identity()
     if identity["role"] not in ["hr", "admin", "director"]:
         return jsonify({"error": "Unauthorized"}), 403
-        
+
     penalty = PenaltyLog.query.get_or_404(id)
     if not penalty.is_lifted:
         return jsonify({"error": "Cannot delete an active suspension record. Lift suspension first."}), 400
-        
+
     db.session.delete(penalty)
     db.session.commit()
     return jsonify({"message": "Lifted suspension record deleted permanently ✓"})
-   
+
+
 @app.route("/stage/casual-payments", methods=["GET", "POST"])
 @jwt_required()
 def manage_casual_payments():
@@ -5605,7 +6125,7 @@ def manage_casual_payments():
         db.session.add(casual)
         db.session.commit()
         return jsonify({"message": "Casual payment saved in internal vault", "id": casual.id}), 201
-    
+
     payments = CasualPayment.query.order_by(CasualPayment.created_at.desc()).all()
     return jsonify([{
         "id": c.id,
@@ -5616,6 +6136,7 @@ def manage_casual_payments():
         "date": c.date
     } for c in payments])
 
+
 @app.route("/stage/attendance-report", methods=["POST"])
 @jwt_required()
 def stage_attendance_report():
@@ -5624,10 +6145,10 @@ def stage_attendance_report():
     date_str = data.get("date")
     absent_count = data.get("absent_count", 0)
     attendance_records = data.get("attendance", [])
-    
+
     absentees = [a["name"] for a in attendance_records if a.get("status") == "Absent"]
     details_str = f"Date: {date_str}. Total Absentees: {absent_count}. Absent Members: {', '.join(absentees) if absentees else 'None'}"
-    
+
     log = AuditLogPermanent(
         action="STAGE_ATTENDANCE_SUBMITTED",
         category="hr",
@@ -5639,21 +6160,27 @@ def stage_attendance_report():
     db.session.add(log)
     db.session.commit()
     return jsonify({"message": f"Attendance registered. {absent_count} absence notifications flagged."})
+
+
 @app.route("/matatus/plates", methods=["GET"])
 @jwt_required()
 def get_matatu_plates():
-    """Returns a simple list of all registered matatu plates for dropdown selectors"""
-    matatus = Matatu.query.all()
+    identity = get_jwt_identity()
+    if identity["role"] in ("driver", "conductor", "owner"):
+        ids = allowed_matatu_ids(identity)
+        matatus = Matatu.query.filter(Matatu.id.in_(ids)).all() if ids else []
+    else:
+        matatus = Matatu.query.all()
     return jsonify([{"id": m.id, "plate": m.plate} for m in matatus])
 
-# ================= STAGE EXPENSES MANAGEMENT =================
 
+# ================= STAGE EXPENSES MANAGEMENT =================
 @app.route("/stage/expenses/draft", methods=["POST"])
 @jwt_required()
 def save_stage_expense_draft():
     identity = get_jwt_identity()
     data = request.get_json()
-    
+
     expense = StageExpense(
         matatu_plate=data.get("matatu_plate", "").strip().upper(),
         type=data.get("expense_type") or data.get("type"),
@@ -5669,17 +6196,18 @@ def save_stage_expense_draft():
     db.session.commit()
     return jsonify({"message": "Expense draft saved successfully", "id": expense.id}), 201
 
+
 @app.route("/stage/expenses/<int:id>/submit", methods=["PUT"])
 @jwt_required()
 def submit_stage_expense(id):
     identity = get_jwt_identity()
     expense = StageExpense.query.get_or_404(id)
-    
+
     if getattr(expense, "is_submitted", False):
         return jsonify({"error": "Expense is already submitted and locked"}), 400
-        
+
     expense.is_submitted = True
-    
+
     # If it's a Police Fee split, route the welfare portion into the Welfare Ledger
     split = expense.split_breakdown
     if split and isinstance(split, dict) and "welfare_pool" in split:
@@ -5697,6 +6225,7 @@ def submit_stage_expense(id):
     db.session.commit()
     return jsonify({"message": "Expense permanently submitted, locked, and splits processed ✓"})
 
+
 @app.route("/stage/expenses", methods=["GET"])
 @jwt_required()
 def get_stage_expenses():
@@ -5705,7 +6234,7 @@ def get_stage_expenses():
     if date_filter:
         query = query.filter_by(date=date_filter)
     expenses = query.order_by(StageExpense.created_at.desc()).all()
-    
+
     return jsonify([{
         "id": e.id,
         "matatu_plate": e.matatu_plate,
@@ -5718,15 +6247,16 @@ def get_stage_expenses():
         "is_submitted": getattr(e, "is_submitted", True),
         "created_at": e.created_at.isoformat() if e.created_at else ""
     } for e in expenses])
-# ================= ISOLATED WELFARE WALLET LEDGER =================
 
+
+# ================= ISOLATED WELFARE WALLET LEDGER =================
 @app.route("/stage/welfare-ledger", methods=["GET", "POST"])
 @jwt_required()
 def manage_welfare_ledger():
     if request.method == "POST":
         data = request.get_json()
         txn = WelfareLedger(
-            type=data.get("type"), # 'Inflow' or 'Payout'
+            type=data.get("type"),  # 'Inflow' or 'Payout'
             recipient_or_source=data.get("recipient_or_source"),
             amount=float(data.get("amount", 0)),
             reason=data.get("reason", ""),
@@ -5737,10 +6267,10 @@ def manage_welfare_ledger():
         return jsonify({"message": "Welfare transaction saved successfully", "id": txn.id}), 201
 
     txns = WelfareLedger.query.order_by(WelfareLedger.created_at.desc()).all()
-    
+
     # Calculate live balance: Inflows add (+), Payouts subtract (-)
     balance = sum(t.amount if t.type == "Inflow" else -t.amount for t in txns)
-    
+
     return jsonify({
         "balance": balance,
         "transactions": [{
@@ -5753,16 +6283,18 @@ def manage_welfare_ledger():
             "created_at": t.created_at.isoformat() if t.created_at else ""
         } for t in txns]
     })
+
+
 # ================= NOTIFICATIONS =================
-@app.route("/notifications", methods=["GET"])      # 👈 ADD THIS LINE
+@app.route("/notifications", methods=["GET"])
 @app.route("/notifications/my", methods=["GET"])
 @jwt_required()
 def get_my_notifications():
     identity = get_jwt_identity()
     user_id = identity.get("id")
-    
+
     notes = Notification.query.filter_by(recipient_id=user_id).order_by(Notification.id.desc()).limit(40).all()
-    
+
     result = []
     for n in notes:
         # Prevent AttributeError if created_at is None
@@ -5776,8 +6308,9 @@ def get_my_notifications():
             "is_read": bool(n.is_read),
             "created_at": created_at_str
         })
-        
+
     return jsonify(result), 200
+
 
 @app.route("/notifications/<int:id>/read", methods=["PUT"])
 @jwt_required()
@@ -5788,6 +6321,7 @@ def mark_notification_read(id):
     db.session.commit()
     return jsonify({"message": "Read"})
 
+
 @app.route("/notifications/read-all", methods=["PUT"])
 @jwt_required()
 def mark_all_notifications_read():
@@ -5795,6 +6329,15 @@ def mark_all_notifications_read():
     Notification.query.filter_by(recipient_id=identity["id"], is_read=False).update({"is_read": True})
     db.session.commit()
     return jsonify({"message": "All read"})
+
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_react(path):
+    if path != "" and os.path.exists(app.static_folder + "/" + path):
+        return send_from_directory(app.static_folder, path)
+    return send_from_directory(app.static_folder, "index.html")
+
 
 # ================= RUN =================
 if __name__ == "__main__":

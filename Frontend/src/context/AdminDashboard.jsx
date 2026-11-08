@@ -1,9 +1,10 @@
-
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "../context/AuthContext";
 import API from "../api";
 import Matatu from "../pages/Matatus";
 import Savings from "../components/Savings";
+import LoanRequirements from "../components/LoanRequirements"; // <-- ADD THIS
+import LoanSecurity from "../components/LoanSecurity";
 
 const tok = () => localStorage.getItem("token");
 const hdr = (json = true) => ({
@@ -31,6 +32,7 @@ const LOAN_STATUS_COLORS = {
   info_required:      "bg-orange-100 text-orange-800",
   guarantor_rejected: "bg-red-100 text-red-700",
   hr_approved:        "bg-emerald-100 text-emerald-800 font-bold",
+  requirements_pending: "bg-amber-100 text-amber-900 border border-amber-300 font-bold", 
   deactivated:        "bg-slate-200 text-slate-700"
 };
 const RISK_COLORS = { High: "text-red-600", Medium: "text-yellow-600", Low: "text-green-600" };
@@ -56,7 +58,6 @@ const TABS = [
 const inp  = "w-full border border-slate-300 rounded-lg p-2 text-sm outline-none focus:border-blue-500 bg-white text-slate-900 placeholder-slate-400";
 const inp3 = "w-full border border-slate-300 rounded-lg p-2.5 text-sm outline-none focus:border-blue-500 bg-white text-slate-900 placeholder-slate-400";
 
-// Helper to safely parse pending_edit whether it is JSON string or Object
 // Helper to safely parse pending_edit whether it is JSON string, double-stringified, or Object
 const parsePendingEdit = (pendingEdit) => {
   if (!pendingEdit) return null;
@@ -190,7 +191,7 @@ export default function AdminDashboard() {
   const [disburseNote, setDisburseNote]           = useState("");
   const [disburseLoading, setDisburseLoading]     = useState(false);
 
-  // savings
+  // savings (legacy list, kept for compatibility)
   const [savings, setSavings]             = useState([]);
   const [savingsSearch, setSavingsSearch] = useState("");
 
@@ -487,7 +488,7 @@ const handleLogout = async (e) => {
   const fetchRoutes    = useCallback(() => fetch(`${API}/routes`).then(r=>r.json()).then(d=>setRoutes(d||[])), []);
   const fetchLoans     = useCallback(() => authGet("/loan-applications/all").then(d=>setLoans(d||[])), []);
   const fetchLoanTypes = useCallback(() => fetch(`${API}/loan-types`).then(r=>r.json()).then(d=>setLoanTypes(d||[])), []);
-  const fetchSavings   = useCallback(() => authGet("/admin/savings").then(d=>setSavings(d||[])), []);
+  const fetchSavings   = useCallback(() => authGet("/admin/savings").then(d=>setSavings(Array.isArray(d) ? d : [])), []);
   const fetchAudit     = useCallback(() => {
     const q = auditCategory!=="all" ? `?category=${auditCategory}` : "";
     return authGet(`/audit/permanent${q}`).then(d=>setAuditLogs(d||[]));
@@ -514,11 +515,9 @@ const fetchStageAuditData = useCallback(async () => {
     } catch(e) {}
   }, []);
 
-  // 1️⃣ PLACE fetchNotifications RIGHT HERE:
 const fetchNotifications = useCallback(async () => {
     try {
       const res = await fetch(`${API}/notifications`, { headers: hdr() });
-      console.log("Notification API HTTP Status:", res.status);
       
       if (!res.ok) {
         console.warn("Backend /notifications route failed or does not exist.");
@@ -526,27 +525,27 @@ const fetchNotifications = useCallback(async () => {
       }
       
       const data = await res.json();
-      console.log("Fetched notifications data:", data);
       if (Array.isArray(data)) setNotifications(data);
     } catch (e) {
       console.error("Failed to fetch notifications:", e);
     }
   }, []);
 
-// ── UPDATE THIS useEffect: ──
   useEffect(() => { 
     fetchStats(); 
     fetchMembers(); 
     fetchMatatus(); 
     fetchRoutes(); 
     fetchNotifications(); 
-    fetchLoans(); // 👈 ADD THIS LINE HERE!
+    fetchLoans();
 
     const interval = setInterval(fetchNotifications, 30000); 
     return () => clearInterval(interval);
   }, [fetchStats, fetchMembers, fetchMatatus, fetchRoutes, fetchNotifications, fetchLoans]);
 
   useEffect(() => {
+    // Refresh headline stats (approved-only savings totals) whenever Overview or Savings is opened
+    if (tab==="overview" || tab==="savings") fetchStats();
     if (tab==="loans")        { fetchLoans(); fetchLoanTypes(); }
     if (tab==="savings")      fetchSavings();
     if (tab==="audit")        fetchAudit();
@@ -556,7 +555,7 @@ const fetchNotifications = useCallback(async () => {
     if (tab==="stage-review") fetchStageAuditData();
     if (tab==="ledger")       fetchLedger();
     if (tab==="payments")     fetchAdminSaccoPayments();
-  }, [tab, fetchLoans, fetchLoanTypes, fetchSavings, fetchAudit, fetchWorkers, fetchAllWarnings, fetchSalaryConfigs, fetchSalaryPayments, fetchSaccoSettings, fetchStageAuditData, fetchLedger, fetchAdminSaccoPayments]);
+  }, [tab, fetchStats, fetchLoans, fetchLoanTypes, fetchSavings, fetchAudit, fetchWorkers, fetchAllWarnings, fetchSalaryConfigs, fetchSalaryPayments, fetchSaccoSettings, fetchStageAuditData, fetchLedger, fetchAdminSaccoPayments]);
   useEffect(() => { if (tab==="audit") fetchAudit(); }, [auditCategory, fetchAudit]);
  const unreadNotificationsCount = notifications.filter(n => !n.is_read).length;
   const loansWithPendingEdits = loans.filter(l => Boolean(l.pending_edit));
@@ -651,7 +650,7 @@ const fetchNotifications = useCallback(async () => {
     }
   };
 
-  // ── FIX: Reject Member with Immediate Optimistic UI Removal ──
+  // ── Reject Member with Immediate Optimistic UI Removal ──
   const rejectMember = async (id) => {
     if (!window.confirm("Reject and delete this pending member registration?")) return;
     try {
@@ -1108,11 +1107,11 @@ const fetchNotifications = useCallback(async () => {
   const activeLoansCount  = stats.active_loans ?? loans.filter(l => ["approved", "disbursed", "repaying"].includes(l.status)).length;
   const pendingLoansCount = stats.pending_loans ?? loans.filter(l => l.status === "pending").length;
   
-  const totalSavingsCalc = stats.total_savings != null && Number(stats.total_savings) > 0
-    ? Number(stats.total_savings)
-    : savings
-        .filter(s => s.transaction_type === "deposit" || !s.transaction_type)
-        .reduce((sum, s) => sum + (Number(s.amount) || 0), 0);
+  // Savings figures come from the backend and only count fully approved transactions.
+  // Personal savings and matatu-account savings are kept separate.
+  const personalSavingsTotal = Number(stats.total_savings || 0);
+  const matatuSavingsTotal   = Number(stats.matatu_savings || 0);
+  const pendingSavingsCount  = Number(stats.pending_savings || 0);
 
   const filteredMembers = members.filter(m =>
     (m.name||"").toLowerCase().includes(memberSearch.toLowerCase()) ||
@@ -1301,6 +1300,11 @@ return (
                   {loansWithPendingEdits.length}
                 </span>
               )}
+              {t.key === "savings" && pendingSavingsCount > 0 && (
+                <span className="bg-amber-400 text-slate-900 text-[10px] font-black px-1.5 py-0.5 rounded-full">
+                  {pendingSavingsCount}
+                </span>
+              )}
             </button>
           ))}
         </nav>
@@ -1310,6 +1314,9 @@ return (
           <p>Active Loans: <span className="text-slate-300 font-bold">{activeLoansCount}</span></p>
           {loansWithPendingEdits.length > 0 && (
             <p className="text-amber-400 font-bold">⚠️ {loansWithPendingEdits.length} Loan Edit(s) Pending</p>
+          )}
+          {pendingSavingsCount > 0 && (
+            <p className="text-amber-400 font-bold">⏳ {pendingSavingsCount} Saving(s) Awaiting Approval</p>
           )}
         </div>
 
@@ -1349,7 +1356,7 @@ return (
     setTab("loans");
     setLoanFilter("edit_pending");
     setLoanSearch("");
-    // 👇 AUTO-SELECT: Opens the side panel immediately on tab switch!
+    // AUTO-SELECT: Opens the side panel immediately on tab switch
     if (loansWithPendingEdits.length > 0) {
       setSelectedLoan(loansWithPendingEdits[0]);
     }
@@ -1366,7 +1373,7 @@ return (
                 { label: "Total Members", value: totalMembersCount, icon: "👥", color: "bg-blue-600", sub: `${pending.length} pending` },
                 { label: "Matatus", value: totalMatatusCount, icon: "🚐", color: "bg-slate-700", sub: `${totalRoutesCount} routes` },
                 { label: "Active Loans", value: activeLoansCount, icon: "💼", color: "bg-amber-600", sub: `${pendingLoansCount} pending` },
-                { label: "Total Savings", value: `KES ${totalSavingsCalc.toLocaleString()}`, icon: "🏦", color: "bg-emerald-600", sub: "all members" },
+                { label: "Personal Savings", value: `KES ${personalSavingsTotal.toLocaleString()}`, icon: "🏦", color: "bg-emerald-600", sub: `Matatu accounts: KES ${matatuSavingsTotal.toLocaleString()}` },
               ].map((s, i) => (
                 <div key={i} className={`${s.color} rounded-xl p-5 text-white shadow-sm`}>
                   <span className="text-3xl">{s.icon}</span>
@@ -2420,7 +2427,7 @@ return (
                     </div>
                     <div className="md:col-span-3">
                       <label className="text-xs text-slate-500 mb-0.5 block font-bold">Description</label>
-                      <input placeholder="Description" value={ltForm.description ?? ""} onChange={e => setLtForm({ ...form, description: e.target.value })} className={inp} />
+                      <input placeholder="Description" value={ltForm.description ?? ""} onChange={e => setLtForm({ ...ltForm, description: e.target.value })} className={inp} />
                     </div>
                     <div className="md:col-span-4 flex justify-end gap-2 mt-2">
                       {editingLtIdForForm && (
@@ -2450,6 +2457,7 @@ return (
                 <option value="edit_pending">
       ⚠️ HR Edit Proposals Pending ({loansWithPendingEdits.length})
     </option>
+    <option value="requirements_pending">📄 Requirements / Cheques Pending</option>
                 <option value="hr_approved">⏳ Awaiting Final Admin Approval</option>
                 <option value="commitment_pending">⏳ Pending Borrower Commitment</option>
                 <option value="commitment_agreed">✅ Agreed Commitment</option>
@@ -2542,7 +2550,7 @@ return (
         </p>
       )}
 
-      {/* 👇 QUICK ACTION BUTTONS: Right on the card! */}
+      {/* QUICK ACTION BUTTONS: Right on the card */}
       {loan.pending_edit && (
         <div className="mt-3 pt-2 border-t border-amber-200 flex gap-2">
           <button
@@ -2580,8 +2588,33 @@ return (
       </div>
       <button onClick={() => setSelectedLoan(null)} className="text-slate-400 hover:text-slate-700 font-bold text-sm">✕</button>
     </div>
+     {/* ── MOUNT LOAN REQUIREMENTS DESK FOR ADMIN ── */}
+    <LoanRequirements
+      loan={selectedLoan}
+      userRole="admin"
+      onDone={async () => {
+        fetchLoans();
+        const updatedList = await authGet("/loan-applications/all");
+        const found = updatedList.find(l => l.id === selectedLoan.id);
+        if (found) setSelectedLoan(found);
+      }}
+      notify={showToast}
+    />
+    
+     {/* 2. Additional Security (Logbook) - Replaces Old Penalty */}
+    <LoanSecurity
+      loan={selectedLoan}
+      userRole="admin"
+      onDone={async () => {
+        fetchLoans();
+        const updated = await authGet("/loan-applications/all");
+        const found = updated.find(l => l.id === selectedLoan.id);
+        if (found) setSelectedLoan(found);
+      }}
+      notify={showToast}
+    />
 
-    {/* ── 🚀 PROMINENT ADMIN "MAKE CHANGES" BANNER ── */}
+    {/* ── PROMINENT ADMIN "MAKE CHANGES" BANNER ── */}
     <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 flex justify-between items-center">
       <div>
         <p className="font-black text-blue-900 text-xs">Need to adjust principal, rate, or duration?</p>
@@ -2791,15 +2824,7 @@ return (
                       </button>
                     )}
 
-                    {["repaying","disbursed"].includes(selectedLoan.status) && (
-                      <div className="border-t border-slate-100 pt-3 space-y-2">
-                        <label className="text-xs text-slate-500 uppercase tracking-widest block">Add Manual Penalty</label>
-                        <input type="number" placeholder="Amount (KES)" value={penaltyAmt} onChange={e=>setPenaltyAmt(e.target.value)} className={inp} />
-                        <input placeholder="Reason" value={penaltyReason} onChange={e=>setPenaltyReason(e.target.value)} className={inp} />
-                        <button onClick={()=>addPenalty(selectedLoan.id)} className="w-full bg-red-500 text-white font-bold py-2 rounded-lg text-sm hover:bg-red-600">⚠️ Add Penalty</button>
-                      </div>
-                    )}
-
+                    
                     {selectedLoan.status !== "deactivated" && (
                       <button onClick={() => deactivateLoan(selectedLoan.id)}
                         className="w-full bg-slate-200 text-slate-700 font-bold py-2 rounded-lg text-xs hover:bg-slate-300">

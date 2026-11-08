@@ -3,6 +3,8 @@ import API from "../api";
 import { useAuth } from "../context/AuthContext";
 import RepaymentAccount from "./RepaymentAccount";
 import MemberStatement from "./MemberStatement";
+import LoanRequirements from "./LoanRequirements";
+import LoanSecurity from "./LoanSecurity";
 
 const tok = () => localStorage.getItem("token");
 const hdr = (json = true) => ({
@@ -25,6 +27,8 @@ const STATUS_CONFIG = {
   repaying:           { color: "bg-blue-100 text-blue-800 border-blue-200",        icon: "🔄", label: "Repaying" },
   cleared:            { color: "bg-green-100 text-green-800 border-green-200",     icon: "🎉", label: "Cleared" },
   defaulted:          { color: "bg-red-200 text-red-900 border-red-300",           icon: "⚠️", label: "Defaulted" },
+  requirements_pending: { color: "bg-amber-100 text-amber-800 border-amber-200", icon: "📄", label: "Submit Requirements" },
+  hr_approved:          { color: "bg-blue-100 text-blue-800 border-blue-200",   icon: "🔎", label: "Awaiting Admin" },
 };
 
 const STEPS = ["Loan Type", "Terms & Conditions", "Loan Details", "Guarantors", "Submit"];
@@ -56,7 +60,6 @@ function Toast({ msg, type, onClose }) {
 
 export default function LoanDashboard() {
   const { user } = useAuth();
-  // views: dashboard | apply | detail | guarantors | guarantorHistory | adminLoanTypes
   const [view, setView] = useState("dashboard");
   const [loans, setLoans]               = useState([]);
   const [loanTypes, setLoanTypes]       = useState([]);
@@ -70,7 +73,6 @@ export default function LoanDashboard() {
   const [toast, setToast]               = useState(null);
   const [loading, setLoading]           = useState(false);
   const [showRepaymentAccount, setShowRepaymentAccount] = useState(false);
-  const [showMyStatement, setShowMyStatement] = useState(false);
   
   // Real-time Notifications
   const [notifications, setNotifications] = useState([]);
@@ -113,6 +115,15 @@ export default function LoanDashboard() {
       fetchGuarantorRequests(), fetchGuarantorHistory(),
       fetchMembers(), fetchMatatus(), fetchNotifications()
     ]);
+  };
+
+  const refreshSelected = async () => {
+    await fetchAll();
+    if (selectedLoan) {
+      const myLoans = await authGet("/loan-applications/my");
+      const u = Array.isArray(myLoans) ? myLoans.find(l => l.id === selectedLoan.id) : null;
+      if (u) setSelectedLoan(u);
+    }
   };
 
   const fetchLoans = async () => {
@@ -173,14 +184,13 @@ export default function LoanDashboard() {
     setView("detail");
   };
 
-  // Calculations for dynamic Daily, Weekly, or Monthly loan payment plans
   useEffect(() => {
     if (selectedType && form.amount && form.repayment_months) {
       const amount = parseFloat(form.amount);
       const periods = parseInt(form.repayment_months);
       const rate   = selectedType.interest_rate;
       
-      let annualMultiplier = periods / 12; // default monthly representation
+      let annualMultiplier = periods / 12;
       if (selectedType.repayment_frequency === "daily") annualMultiplier = periods / 365;
       if (selectedType.repayment_frequency === "weekly") annualMultiplier = periods / 52;
 
@@ -191,7 +201,7 @@ export default function LoanDashboard() {
       setCalc({
         totalInterest: totalInterest.toFixed(2),
         totalPayable: totalPayable.toFixed(2),
-        monthly: singleInstallment.toFixed(2), // serves as 'per period payment'
+        monthly: singleInstallment.toFixed(2),
         rate
       });
     } else {
@@ -290,9 +300,7 @@ export default function LoanDashboard() {
     if (!res.ok) return showToast("Failed to send response", "error");
     showToast("Response submitted — loan is back under review ✓");
     setInfoResponse(""); setInfoDoc(null);
-    fetchLoans();
-    const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
-    if (updated) setSelectedLoan(updated);
+    refreshSelected();
   };
 
   const addGuarantor = (m) => {
@@ -307,7 +315,8 @@ export default function LoanDashboard() {
     m.name?.toLowerCase().includes(guarantorSearch.toLowerCase()) ||
     m.membership_no?.toLowerCase().includes(guarantorSearch.toLowerCase())
   );
-  const activeLoan    = loans.find(l => ["repaying","disbursed","approved"].includes(l.status));
+  
+  const activeLoan    = loans.find(l => ["requirements_pending","approved","disbursed","repaying","defaulted"].includes(l.status));
   const totalBorrowed = loans.filter(l => l.status === "cleared").reduce((s,l) => s + l.amount, 0);
 
   const GUARANTEE_STATUS = {
@@ -354,7 +363,7 @@ export default function LoanDashboard() {
           {view === "dashboard" && (
             <div className="flex gap-2 flex-wrap items-center">
               
-              {/* High Contrast, Fully Readable Notifications Panel */}
+              {/* Notifications Panel */}
               <div className="relative z-50">
                 <button onClick={() => setShowNotesDrop(!showNotesDrop)}
                   className="bg-white border border-gray-300 text-slate-800 font-extrabold px-4 py-2 rounded-lg text-sm hover:bg-slate-100 flex items-center gap-1.5 relative shadow-sm">
@@ -439,6 +448,54 @@ export default function LoanDashboard() {
         {view === "dashboard" && (
           <div className="space-y-6">
 
+            {/* ACTION REQUIRED BANNER: POST-APPROVAL REQUIREMENTS */}
+            {loans.some(l => l.status === "requirements_pending") && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-5 shadow-sm flex items-center justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <span className="text-3xl">📄</span>
+                  <div>
+                    <h4 className="font-black text-amber-900 text-base">Loan Approved – Post-Approval Requirements Pending</h4>
+                    <p className="text-amber-800 text-xs font-semibold mt-0.5">
+                      Your loan has been approved! Submit your signed loan form, insurance document, and bank charges reference to release the cheque.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    const reqLoan = loans.find(l => l.status === "requirements_pending");
+                    if (reqLoan) fetchLoanDetail(reqLoan);
+                  }}
+                  className="bg-amber-600 hover:bg-amber-700 text-white font-black text-xs px-4 py-2.5 rounded-lg shadow-sm"
+                >
+                  Submit Requirements →
+                </button>
+              </div>
+            )}
+
+            {/* ACTION REQUIRED BANNER: VEHICLE LOGBOOK SECURITY */}
+            {(activeLoan?.security_status === "required" || loans.some(l => l.security_status === "required")) && (
+              <div className="bg-red-50 border-2 border-red-300 rounded-2xl p-5 shadow-sm flex items-center justify-between gap-4 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <span className="text-3xl">📘</span>
+                  <div>
+                    <h4 className="font-black text-red-900 text-base">Action Required: Additional Security (Logbook)</h4>
+                    <p className="text-red-800 text-xs font-semibold mt-0.5">
+                      SACCO administration has requested your vehicle logbook as additional security. Open the loan details to upload your copy.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    const secLoan = loans.find(l => l.security_status === "required") || activeLoan;
+                    if (secLoan) fetchLoanDetail(secLoan);
+                  }}
+                  className="bg-red-600 hover:bg-red-700 text-white font-black text-xs px-4 py-2.5 rounded-lg shadow-sm"
+                >
+                  Upload Logbook →
+                </button>
+              </div>
+            )}
+
             {/* Eligibility Card */}
             {eligibility && (
               <div className={`rounded-xl p-5 border ${eligibility.eligible ? "bg-emerald-50 border-emerald-200" : "bg-red-50 border-red-200"}`}>
@@ -462,7 +519,7 @@ export default function LoanDashboard() {
               </div>
             )}
 
-            {/* HIGH-PRIORITY BORROWER COMMITMENT PROMPT CARD (Home Screen Portal Visibility) */}
+            {/* Policy Rate Change Notice Card */}
             {activeLoan?.rate_change_pending && (
               <div className="bg-blue-50 border-2 border-blue-300 rounded-2xl p-5 shadow-lg space-y-4">
                 <div className="flex items-center gap-2 text-blue-900 border-b border-blue-100 pb-2">
@@ -494,7 +551,7 @@ export default function LoanDashboard() {
                   <button
                     onClick={async () => {
                       const reason = prompt("State your reason for declining these revised loan terms:");
-                      if (reason === null) return; // borrower cancelled prompt
+                      if (reason === null) return;
                       setLoading(true);
                       const res = await authPut(`/loan-applications/${activeLoan.id}/commitment`, { status: "disagreed", reason });
                       setLoading(false);
@@ -561,23 +618,17 @@ export default function LoanDashboard() {
                     style={{ width: `${Math.min(((activeLoan.amount_repaid || 0) / (activeLoan.total_payable || 1)) * 100, 100)}%` }} />
                 </div>
 
-               <div className="flex gap-2 flex-wrap">
+                <div className="flex gap-2 flex-wrap">
                   <button onClick={() => fetchLoanDetail(activeLoan)} className="bg-gray-100 text-gray-700 font-bold px-4 py-2 rounded-lg text-sm hover:bg-gray-200">
                     View Schedule & Logs
                   </button>
-                  {["approved", "disbursed", "repaying", "active", "defaulted"].includes(activeLoan.status) && (
-                    <>
-                      {activeLoan.penalty > 0 && activeLoan.penalty_status !== "pending_approval" ? (
-                        <div className="text-red-700 text-xs font-bold bg-red-50 border border-red-200 px-3 py-2 rounded-lg">
-                          ⚠️ Standard payments are blocked due to an active penalty. Open 'View Schedule & Logs' to clear it.
-                        </div>
-                      ) : (
-                        <button onClick={() => { setSelectedLoan(activeLoan); setShowPayModal(true); }}
-                          className="bg-emerald-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-emerald-700">
-                          💳 Make Payment
-                        </button>
-                      )}
-                    </>
+
+                  {/* Payment option only visible once funds are disbursed / in repayment */}
+                  {["disbursed", "repaying", "defaulted"].includes(activeLoan.status) && (
+                    <button onClick={() => { setSelectedLoan(activeLoan); setShowPayModal(true); }}
+                      className="bg-emerald-600 text-white font-bold px-4 py-2 rounded-lg text-sm hover:bg-emerald-700">
+                      💳 Make Payment
+                    </button>
                   )}
                 </div>
               </div>
@@ -670,7 +721,7 @@ export default function LoanDashboard() {
               <div className="max-w-2xl">
                 <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Terms & Conditions Agreement</h2>
                 <p className="text-gray-500 text-sm mb-4">
-                  Review the customized regulatory rules for <span className="font-bold text-gray-700">{selectedType.name}</span>.
+                  Review the regulatory rules for <span className="font-bold text-gray-700">{selectedType.name}</span>.
                 </p>
 
                 <div className="bg-white border border-gray-200 rounded-xl p-5 mb-4">
@@ -687,10 +738,9 @@ export default function LoanDashboard() {
                     <div className="bg-gray-50 rounded-lg p-4 mb-4 text-sm text-gray-600 space-y-2">
                       <p className="font-bold text-gray-800">Dynamic Schedule Regulations</p>
                       <ul className="space-y-1 text-xs font-semibold">
-                        <li>• Custom Limits: KES {selectedType.min_amount?.toLocaleString()} – KES {selectedType.max_amount?.toLocaleString()}</li>
+                        <li>• Limits: KES {selectedType.min_amount?.toLocaleString()} – KES {selectedType.max_amount?.toLocaleString()}</li>
                         <li>• Repayment Frequency: Paid <span className="text-emerald-700 capitalize">{selectedType.repayment_frequency}</span></li>
                         <li>• Start Date Policy: {selectedType.repayment_start_rule === "same_day" ? "Schedules activate on the exact day of borrowing / approval" : "First payment occurs at the end of the first cycle"}</li>
-                        <li>• Penalty Rule: {selectedType.penalty_amount}% ({selectedType.penalty_type}) late fees apply following a {selectedType.grace_period_days}-day grace period</li>
                       </ul>
                     </div>
                   )}
@@ -699,7 +749,7 @@ export default function LoanDashboard() {
                     <input type="checkbox" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)}
                       className="mt-0.5 w-5 h-5 rounded accent-emerald-600 flex-shrink-0" />
                     <span className="text-sm text-gray-700 font-bold">
-                      I confirm I have opened, read, and accepted all Terms & Conditions. I understand the repayment cycles and late penalty fees.
+                      I confirm I have opened, read, and accepted all Terms & Conditions.
                     </span>
                   </label>
                 </div>
@@ -716,13 +766,12 @@ export default function LoanDashboard() {
               </div>
             )}
 
-            {/* STEP 2: Calculate Repayment Rates & Details */}
+            {/* STEP 2: Application Details */}
             {step === 2 && selectedType && (
               <div className="max-w-2xl">
                 <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Enter Application Details</h2>
                 <p className="text-gray-400 text-sm mb-6 font-semibold">
-                  Repayment Cycle: <span className="font-bold text-emerald-600 capitalize">{selectedType.repayment_frequency}</span> · 
-                  Start Date: <span className="font-bold text-blue-600 capitalize">{selectedType.repayment_start_rule?.replace("_", " ")}</span>
+                  Repayment Cycle: <span className="font-bold text-emerald-600 capitalize">{selectedType.repayment_frequency}</span>
                 </p>
 
                 <div className="space-y-4 bg-white border border-gray-200 rounded-xl p-6 mb-4">
@@ -734,7 +783,7 @@ export default function LoanDashboard() {
                         min={selectedType.min_amount} max={selectedType.max_amount} className={inp} />
                     </div>
                     <div>
-                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Number of Installments ({selectedType.repayment_frequency})</label>
+                      <label className="text-xs text-gray-700 uppercase tracking-widest mb-1 block font-bold">Installments ({selectedType.repayment_frequency})</label>
                       <input type="number" placeholder={`${selectedType.min_months}–${selectedType.max_months}`}
                         value={form.repayment_months} onChange={e => setForm({...form, repayment_months:e.target.value})}
                         min={selectedType.min_months} max={selectedType.max_months} className={inp} />
@@ -764,9 +813,6 @@ export default function LoanDashboard() {
                         </div>
                       ))}
                     </div>
-                    <p className="text-xs text-emerald-800 font-semibold mt-3">
-                      💡 Payments can be made at any point. Pre-paying multiple intervals moves your due period forward automatically.
-                    </p>
                   </div>
                 )}
 
@@ -782,7 +828,7 @@ export default function LoanDashboard() {
               </div>
             )}
 
-            {/* STEP 3 & 4 (Add Guarantors and Review) */}
+            {/* STEP 3: Add Guarantors */}
             {step === 3 && (
               <div className="max-w-2xl">
                 <h2 className="text-xl font-black text-gray-800 mb-1 font-bold">Select Guarantors</h2>
@@ -835,6 +881,7 @@ export default function LoanDashboard() {
               </div>
             )}
 
+            {/* STEP 4: Final Review */}
             {step === 4 && (
               <div className="max-w-2xl">
                 <h2 className="text-xl font-black text-gray-800 mb-6 font-bold">Final Review & Submit</h2>
@@ -842,10 +889,10 @@ export default function LoanDashboard() {
                   <div className="bg-white border border-gray-200 rounded-xl p-5">
                     <h4 className="font-black text-gray-600 text-xs uppercase tracking-widest mb-3">Application details</h4>
                     <div className="grid grid-cols-2 gap-3 text-sm">
-                      <div><p className="text-gray-400 font-semibold font-semibold">Loan Type</p><p className="font-black text-gray-800">{selectedType?.name}</p></div>
-                      <div><p className="text-gray-400 font-semibold font-semibold">Intervals</p><p className="font-black text-gray-800">{form.repayment_months} ({selectedType?.repayment_frequency})</p></div>
-                      <div><p className="text-gray-400 font-semibold font-semibold">Total Payable</p><p className="font-black text-gray-800">KES {parseFloat(calc?.totalPayable)?.toLocaleString()}</p></div>
-                      <div><p className="text-gray-400 font-semibold font-semibold">Purpose</p><p className="font-medium text-gray-800">{form.purpose}</p></div>
+                      <div><p className="text-gray-400 font-semibold">Loan Type</p><p className="font-black text-gray-800">{selectedType?.name}</p></div>
+                      <div><p className="text-gray-400 font-semibold">Intervals</p><p className="font-black text-gray-800">{form.repayment_months} ({selectedType?.repayment_frequency})</p></div>
+                      <div><p className="text-gray-400 font-semibold">Total Payable</p><p className="font-black text-gray-800">KES {parseFloat(calc?.totalPayable)?.toLocaleString()}</p></div>
+                      <div><p className="text-gray-400 font-semibold">Purpose</p><p className="font-medium text-gray-800">{form.purpose}</p></div>
                     </div>
                   </div>
                 </div>
@@ -883,6 +930,7 @@ export default function LoanDashboard() {
                   <p className="text-blue-800 text-sm">{selectedLoan.admin_notes}</p>
                 </div>
               )}
+
               {selectedLoan.status === "info_required" && (
                 <div className="bg-amber-50 border border-amber-300 rounded-xl p-5 mb-4">
                   <h4 className="font-black text-amber-900 text-sm mb-1">ℹ️ Action Required: Upload Additional Information</h4>
@@ -916,39 +964,13 @@ export default function LoanDashboard() {
                 </div>
               )}
 
-              {/* Penalty Clearance Box */}
-              {selectedLoan.penalty > 0 && (
-                <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex justify-between items-center mb-4">
-                  <div>
-                    <p className="font-black text-red-800 text-sm">⚠️ Penalty Fee: KES {selectedLoan.penalty.toLocaleString()}</p>
-                    <p className="text-red-600 text-xs font-semibold">
-                      {selectedLoan.penalty_status === "pending_approval"
-                        ? "⏳ Penalty payment submitted. Awaiting approval from HR/Admin."
-                        : "Standard installment repayments are blocked until this penalty is cleared."}
-                    </p>
-                  </div>
-                  {selectedLoan.penalty_status !== "pending_approval" && (
-                    <button
-                      onClick={async () => {
-                        const amt = prompt("Enter amount to clear towards penalty:", selectedLoan.penalty);
-                        if (!amt || isNaN(amt)) return;
-                        const res = await authPost(`/loan-applications/${selectedLoan.id}/pay-penalty`, { amount: parseFloat(amt) });
-                        if (res.ok) {
-                          showToast("Penalty payment submitted for approval ✓");
-                          fetchAll();
-                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
-                          if (updated) setSelectedLoan(updated);
-                        }
-                      }}
-                      className="bg-red-600 text-white font-bold text-xs px-3 py-1.5 rounded-lg hover:bg-red-700"
-                    >
-                      Clear Penalty
-                    </button>
-                  )}
-                </div>
-              )}
+              {/* POST-APPROVAL REQUIREMENTS & VEHICLE LOGBOOK SECURITY WORKFLOWS */}
+              <div className="space-y-4 mb-4">
+                <LoanRequirements loan={selectedLoan} userRole="member" onDone={refreshSelected} notify={showToast} />
+                <LoanSecurity     loan={selectedLoan} userRole="member" onDone={refreshSelected} notify={showToast} />
+              </div>
 
-              {/* High Contrast Rate Revision Borrower Commitment Notice */}
+              {/* Policy Rate Revision Notice */}
               {selectedLoan.rate_change_pending && (
                 <div className="bg-blue-50 border-2 border-blue-300 rounded-xl p-5 mb-5 shadow-sm">
                   <h4 className="font-black text-blue-900 text-base mb-2 flex items-center gap-2">📢 Policy Rate Modification Notice</h4>
@@ -961,9 +983,7 @@ export default function LoanDashboard() {
                         const res = await authPut(`/loan-applications/${selectedLoan.id}/commitment`, { status: "agreed" });
                         if (res.ok) {
                           showToast("Commitment agreement sent to HR/Admin ✓");
-                          fetchAll();
-                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
-                          if (updated) setSelectedLoan(updated);
+                          refreshSelected();
                         } else {
                           showToast("Failed to agree", "error");
                         }
@@ -979,9 +999,7 @@ export default function LoanDashboard() {
                         const res = await authPut(`/loan-applications/${selectedLoan.id}/commitment`, { status: "disagreed", reason });
                         if (res.ok) {
                           showToast("Notice sent back to HR/Admin ✓");
-                          fetchAll();
-                          const updated = (await authGet("/loan-applications/my")).find(l => l.id === selectedLoan.id);
-                          if (updated) setSelectedLoan(updated);
+                          refreshSelected();
                         } else {
                           showToast("Failed to decline", "error");
                         }
@@ -1010,7 +1028,7 @@ export default function LoanDashboard() {
               </div>
 
               {/* Repay progress */}
-              {["repaying","cleared","disbursed","approved"].includes(selectedLoan.status) && (
+              {["repaying","cleared","disbursed"].includes(selectedLoan.status) && (
                 <div className="mt-4">
                   <div className="flex justify-between text-xs text-gray-400 mb-1">
                     <span>Repaid: KES {selectedLoan.amount_repaid?.toLocaleString()}</span>
@@ -1023,18 +1041,13 @@ export default function LoanDashboard() {
                 </div>
               )}
 
-              {["approved","disbursed","repaying"].includes(selectedLoan.status) && (
+              {/* Payment actions only active once disbursed / active */}
+              {["disbursed", "repaying", "defaulted"].includes(selectedLoan.status) && (
                 <div className="flex gap-2 mt-4 flex-wrap">
-                  {selectedLoan.penalty > 0 && selectedLoan.penalty_status !== "pending_approval" ? (
-                    <div className="w-full bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-xs font-bold leading-relaxed">
-                      ⚠️ Regular repayments are blocked because you have an outstanding penalty of <strong>KES {selectedLoan.penalty?.toLocaleString()}</strong>. Use the <strong>"Clear Penalty"</strong> option below first. Regular payments will resume once approved.
-                    </div>
-                  ) : (
-                    <button onClick={() => setShowPayModal(true)}
-                      className="bg-emerald-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-emerald-700">
-                      💳 Record Payment
-                    </button>
-                  )}
+                  <button onClick={() => setShowPayModal(true)}
+                    className="bg-emerald-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-emerald-700">
+                    💳 Record Payment
+                  </button>
                   <button onClick={() => setShowRepaymentAccount(true)}
                     className="bg-blue-600 text-white font-black px-6 py-2.5 rounded-lg hover:bg-blue-700">
                     🏦 Repayment Account & Logs
@@ -1043,7 +1056,7 @@ export default function LoanDashboard() {
               )}
             </div>
 
-            {/* Repayment schedule displaying dynamic dates */}
+            {/* Repayment schedule */}
             {selectedLoan.schedule?.length > 0 && (
               <div className="bg-white border border-gray-200 rounded-xl p-5">
                 <h3 className="font-black text-gray-700 mb-3">Installment Repayment Schedule</h3>
@@ -1231,7 +1244,6 @@ export default function LoanDashboard() {
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-              {/* Existing Types list */}
               <div className="space-y-3 bg-white border border-gray-200 rounded-xl p-5 shadow-sm">
                 <h3 className="font-black text-gray-800 text-sm mb-2 uppercase tracking-wider">Configured Types</h3>
                 {loanTypes.map(lt => (
@@ -1277,7 +1289,6 @@ export default function LoanDashboard() {
                 </button>
               </div>
 
-              {/* Form container */}
               <div className="lg:col-span-2 bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
                 <h3 className="font-black text-gray-800 text-sm border-b border-gray-100 pb-2">
                   {selectedType ? `Modify ${selectedType.name} Specifications` : "Configure a New Loan Type"}
@@ -1336,48 +1347,16 @@ export default function LoanDashboard() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 border-t border-gray-100 pt-3">
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Penalty Calculation</label>
-                    <select value={form.penalty_type || "percentage"}
-                      onChange={e => setForm({ ...form, penalty_type: e.target.value })} className={inp}>
-                      <option value="percentage">Percentage on overdue installment</option>
-                      <option value="fixed">Fixed cash penalty fee</option>
-                      <option value="disciplinary">Account Suspension warning</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Overdue Penalty Rate / Amount</label>
-                    <input type="number" placeholder="e.g. 5" value={form.penalty_amount || ""}
-                      onChange={e => setForm({ ...form, penalty_amount: e.target.value })} className={inp} />
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Overdue Accumulation Period</label>
-                    <select value={form.penalty_frequency || "monthly"}
-                      onChange={e => setForm({ ...form, penalty_frequency: e.target.value })} className={inp}>
-                      <option value="daily">Accrues Daily</option>
-                      <option value="weekly">Accrues Weekly</option>
-                      <option value="monthly">Accrues Monthly</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Grace Period (Days)</label>
-                    <input type="number" placeholder="e.g. 3" value={form.grace_period_days || ""}
-                      onChange={e => setForm({ ...form, grace_period_days: e.target.value })} className={inp} />
-                  </div>
-                </div>
-
                 <div className="border-t border-gray-100 pt-3">
                   <label className="text-xs text-gray-700 uppercase tracking-widest font-bold mb-1 block">Description</label>
                   <textarea placeholder="Write a short description..." value={form.description || ""}
                     onChange={e => setForm({ ...form, description: e.target.value })} rows={2} className={`${inp} resize-none`} />
                 </div>
 
-                {/* Terms document uploader */}
                 {selectedType && (
                   <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 space-y-2">
                     <p className="text-xs text-blue-700 font-bold uppercase tracking-wide">📄 Upload / Update Terms & Conditions (PDF / Image)</p>
-                    <p className="text-[11px] text-blue-600 font-bold">Borrowers must read and accept this before applying. You can update it anytime.</p>
+                    <p className="text-[11px] text-blue-600 font-bold">Borrowers must read and accept this before applying.</p>
                     <input type="file" accept="image/*,.pdf"
                       onChange={e => handleFileUpload(selectedType.id, e.target.files[0])}
                       className="w-full border border-blue-300 rounded-lg p-2 text-xs bg-white text-gray-700 file:mr-3 file:bg-blue-600 file:text-white file:border-0 file:rounded file:px-3 file:py-1 file:font-bold file:text-xs" />
@@ -1401,11 +1380,7 @@ export default function LoanDashboard() {
                       max_months: parseInt(form.max_months),
                       description: form.description,
                       repayment_frequency: form.repayment_frequency,
-                      repayment_start_rule: form.repayment_start_rule,
-                      penalty_type: form.penalty_type,
-                      penalty_amount: parseFloat(form.penalty_amount),
-                      penalty_frequency: form.penalty_frequency,
-                      grace_period_days: parseInt(form.grace_period_days)
+                      repayment_start_rule: form.repayment_start_rule
                     };
 
                     const url = selectedType ? `${API}/loan-types/${selectedType.id}` : `${API}/loan-types`;

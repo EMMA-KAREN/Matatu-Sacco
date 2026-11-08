@@ -24,7 +24,7 @@ function Toast({ msg, type, onClose }) {
 }
 
 export default function DriverDashboard() {
-  const { user } = useAuth();
+const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState("home");
   const [assignment, setAssignment] = useState(null);
   const [assignmentError, setAssignmentError] = useState(null);
@@ -76,6 +76,20 @@ export default function DriverDashboard() {
     if (activeTab === "guarantors") fetchGuarantorHistory();
   }, [activeTab, assignment]);
 
+
+const handleLogout = async (e) => {
+  if (e) e.preventDefault();
+  try {
+    if (typeof logout === "function") await logout();
+  } catch (err) {
+    console.error("Logout error:", err);
+  } finally {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    sessionStorage.clear();
+    window.location.href = "/login";
+  }
+};
   const fetchEarnings = async () => {
     const res = await fetch(`${API}/earnings/matatu/${assignment.matatu_id}`, { headers });
     setEarnings(await res.json());
@@ -225,6 +239,12 @@ export default function DriverDashboard() {
             <p className="text-emerald-400 font-black text-lg">{assignment.plate}</p>
             <p className="text-xs text-gray-400 mt-1">Owner: {assignment.owner_name}</p>
             <span className="inline-block mt-1 text-xs capitalize bg-gray-700 text-gray-300 px-2 py-0.5 rounded">{assignment.role}</span>
+          <button
+  onClick={handleLogout}
+  className="w-full mt-3 px-3 py-2 rounded-lg text-sm bg-red-600 hover:bg-red-700 text-white font-bold transition-all text-center block"
+>
+  🚪 Logout
+</button>
           </div>
         )}
       </div>

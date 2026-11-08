@@ -7,6 +7,8 @@ import API from "../api";
 import MemberStatement from "../components/MemberStatement";
 import HRStageAuditsAndReports from "../components/HRStageAuditsAndReports";
 import Savings from "../components/Savings";
+import LoanRequirements from "../components/LoanRequirements";
+import LoanSecurity from "../components/LoanSecurity";
 
 const tok = () => localStorage.getItem("token");
 const hdr = () => ({ Authorization: `Bearer ${tok()}`, "Content-Type": "application/json" });
@@ -25,6 +27,7 @@ const LOAN_STATUS_COLORS = {
   cleared: "bg-green-200 text-green-900",
   defaulted: "bg-red-200 text-red-900",
   info_required: "bg-orange-100 text-orange-800",
+  requirements_pending: "bg-amber-100 text-amber-900 border border-amber-300 font-bold",
   deactivated: "bg-slate-200 text-slate-700",
 };
 
@@ -52,7 +55,7 @@ function Toast({ msg, type, onClose }) {
 }
 
 export default function HRDashboard() {
-  const { user } = useAuth();
+const { user, logout } = useAuth();
   const [tab, setTab] = useState("members");
   const [toast, setToast] = useState(null);
   const showToast = (msg, type = "success") => setToast({ msg, type });
@@ -91,7 +94,20 @@ export default function HRDashboard() {
     purpose: "",
     notes: ""
   });
-
+  
+  const handleLogout = async (e) => {
+  if (e) e.preventDefault();
+  try {
+    if (typeof logout === "function") await logout();
+  } catch (err) {
+    console.error("Logout error:", err);
+  } finally {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    sessionStorage.clear();
+    window.location.href = "/login";
+  }
+};
   // ── notifications ──
   const [notifications, setNotifications] = useState([]);
   const [showNotificationsModal, setShowNotificationsModal] = useState(false);
@@ -553,35 +569,45 @@ export default function HRDashboard() {
       )}
 
       {/* SIDEBAR */}
-      <div className="hidden md:flex md:w-60 bg-slate-900 border-r border-slate-700 flex-col p-5 flex-shrink-0">
-        <div className="mb-8">
+<div className="app-sidebar flex w-full md:w-60 bg-slate-900 border-b md:border-b-0 md:border-r border-slate-700 flex-col p-3 md:p-5 flex-shrink-0">
+  <div className="sidebar-header mb-2 md:mb-8">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3">
               <div className="w-10 h-10 rounded-lg bg-emerald-600 flex items-center justify-center text-white font-black text-sm">HR</div>
               <div>
                 <p className="font-black text-white text-sm">{user?.name?.split(" ")[0]}</p>
                 <p className="text-xs text-slate-400 uppercase tracking-widest">Manager</p>
+                 <div className="flex items-center gap-2">
+  <button
+    onClick={() => setShowNotificationsModal(true)}
+    className="relative p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition"
+    title="Notifications"
+  >
+    🔔
+    {unreadNotificationsCount > 0 && (
+      <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[9px] font-black w-4 h-4 rounded-full flex items-center justify-center animate-pulse">
+        {unreadNotificationsCount}
+      </span>
+    )}
+  </button>
+  <button
+    onClick={handleLogout}
+    className="p-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition"
+    title="Logout"
+  >
+    🚪 <span className="hidden md:inline">Logout</span>
+  </button>
+</div>
               </div>
             </div>
 
             {/* 🔔 Notification Bell Button */}
-            <button
-              onClick={() => setShowNotificationsModal(true)}
-              className="relative p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition"
-              title="Notifications"
-            >
-              🔔
-              {unreadNotificationsCount > 0 && (
-                <span className="absolute -top-1 -right-1 bg-red-500 text-white text-[9px] font-black w-4 h-4 rounded-full flex items-center justify-center animate-pulse">
-                  {unreadNotificationsCount}
-                </span>
-              )}
-            </button>
+         
           </div>
           <div className="h-px bg-slate-700" />
         </div>
 
-        <nav className="space-y-0.5 flex-1">
+  <nav className="sidebar-nav space-y-0.5 flex-1">
           {TABS.map(t => (
             <button key={t.key} onClick={() => setTab(t.key)}
               className={`w-full text-left px-3 py-2.5 rounded-lg text-sm transition-all ${tab === t.key ? "bg-emerald-600 text-white font-bold" : "text-slate-400 hover:bg-slate-800 hover:text-white"}`}>
@@ -589,7 +615,7 @@ export default function HRDashboard() {
             </button>
           ))}
         </nav>
-        <div className="mt-4 pt-4 border-t border-slate-700 space-y-1 text-xs text-slate-500">
+  <div className="sidebar-footer mt-4 pt-4 border-t border-slate-700 space-y-1 text-xs text-slate-500">
           <p>Members: <span className="text-slate-300 font-bold">{stats.total || 0}</span></p>
           <p>Pending: <span className="text-amber-400 font-bold">{stats.pending || 0}</span></p>
           <p className="text-xs text-slate-600 mt-2 italic">Deactivations are permanently audited</p>
@@ -824,6 +850,7 @@ export default function HRDashboard() {
               <select value={loanFilter} onChange={e => setLoanFilter(e.target.value)}
                 className="border border-slate-300 rounded-lg p-2.5 text-sm outline-none focus:border-blue-500 bg-white font-bold">
                 <option value="all">Active Applications</option>
+                <option value="requirements_pending">📄 Requirements Pending</option> 
                 {["pending", "guarantors_pending", "hr_approved", "approved", "rejected", "disbursed", "repaying", "cleared", "defaulted", "info_required", "deactivated"].map(s => (
                   <option key={s} value={s}>{s.replace("_", " ")}</option>
                 ))}
@@ -906,8 +933,32 @@ export default function HRDashboard() {
                         <button onClick={() => setSelectedLoan(null)} className="text-slate-400 hover:text-slate-700 font-bold ml-2">✕</button>
                       </div>
                     </div>
+                    
+                                {/* ── MOUNT LOAN REQUIREMENTS DESK FOR HR (RECORDING PAYMENTS & UPLOADS) ── */}
+              <LoanRequirements
+                loan={selectedLoan}
+                userRole="hr"
+                onDone={async () => {
+                  fetchLoans();
+                  const updatedList = await authGet("/loan-applications/all");
+                  const found = updatedList.find(l => l.id === selectedLoan.id);
+                  if (found) setSelectedLoan(found);
+                }}
+                notify={showToast}
+              />
+              <LoanSecurity
+                    loan={selectedLoan}
+                    userRole="hr"
+                    onDone={async () => {
+                      fetchLoans();
+                      const updated = await authGet("/loan-applications/all");
+                      const found = updated.find(l => l.id === selectedLoan.id);
+                      if (found) setSelectedLoan(found);
+                    }}
+                    notify={showToast}
+                  />
 
-                    {/* Pending Edit Notice Box */}
+                            {/* Pending Edit Notice Box */}
                     {selectedLoan.pending_edit && (
                       <div className="bg-amber-50 border-2 border-amber-300 rounded-xl p-4 text-xs shadow-sm space-y-2">
                         <div className="flex justify-between items-center">

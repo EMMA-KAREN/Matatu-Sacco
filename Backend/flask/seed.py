@@ -14,7 +14,7 @@ with app.app_context():
             role="admin",
             is_active=True
         )
-        admin.set_password("ChangeThisSecret2026!")
+        admin.set_password("""" ChangeThisSecret2026! """")
         db.session.add(admin)
         db.session.commit()
         print("Admin created: ADMIN001")

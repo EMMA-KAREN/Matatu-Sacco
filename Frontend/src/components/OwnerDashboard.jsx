@@ -37,7 +37,7 @@ function Toast({ msg, type, onClose }) {
 }
 
 export default function OwnerDashboard() {
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const [activeTab, setActiveTab] = useState("home");
   const [matatus, setMatatus]     = useState([]);
   const [selectedMatatu, setSelectedMatatu] = useState(null);
@@ -138,33 +138,24 @@ export default function OwnerDashboard() {
 
   // OWNER personal savings only — /savings/my returns ALL savings including where matatu_id is set
   // We filter: only show transactions where matatu_id is null (personal) in the personal view
-  const fetchSavings = useCallback(async () => {
-    const res  = await fetch(`${API}/savings/my`, { headers });
-    const data = await res.json();
-    if (data) {
-      // filter to personal only (no matatu_id) for display
-      const personalTx = (data.transactions || []).filter(t => !t.matatu_id);
-      const personalBal = personalTx.reduce(
-        (s, t) => s + (t.transaction_type === "deposit" ? t.amount : -t.amount), 0
-      );
-      setSavingsData({ balance: personalBal, transactions: personalTx });
-    }
-  }, []);
+ const fetchSavings = useCallback(async () => {
+  const res  = await fetch(`${API}/savings/my`, { headers });
+  const data = await res.json();
+  if (data) {
+    setSavingsData({
+      balance: data.balance || 0, // personal only, approved only
+      transactions: (data.transactions || []).filter(t => !t.matatu_id)
+    });
+  }
+}, []);
 
-  const fetchMatatuSavings = async (matatuId) => {
-    // This fetches ALL savings linked to this matatu (driver + conductor + owner deposits)
-    // But owner sees it only from /savings/matatu/:id which is the total pool
-    // We need to show ONLY owner's own deposits to the matatu
-    const res  = await fetch(`${API}/savings/my`, { headers });
+const fetchMatatuSavings = async (matatuId) => {
+  const res = await fetch(`${API}/savings/matatu/${matatuId}`, { headers });
+  if (res.ok) {
     const data = await res.json();
-    if (data) {
-      const mTx = (data.transactions || []).filter(t => t.matatu_id === matatuId);
-      const mBal = mTx.reduce(
-        (s, t) => s + (t.transaction_type === "deposit" ? t.amount : -t.amount), 0
-      );
-      setMatatuSavings(prev => ({ ...prev, [matatuId]: { balance: mBal, transactions: mTx } }));
-    }
-  };
+    setMatatuSavings(prev => ({ ...prev, [matatuId]: data }));
+  }
+};
 
   const fetchSaccoPayments = useCallback(async () => {
     const res = await fetch(`${API}/sacco-payments/my`, { headers });
@@ -217,6 +208,20 @@ export default function OwnerDashboard() {
     setNewDoc({ number:"", type:"", issue:"", expiry:"", file:null });
     fetchMatatus();
   };
+
+const handleLogout = async (e) => {
+  if (e) e.preventDefault();
+  try {
+    if (typeof logout === "function") await logout();
+  } catch (err) {
+    console.error("Logout error:", err);
+  } finally {
+    localStorage.removeItem("token");
+    localStorage.removeItem("user");
+    sessionStorage.clear();
+    window.location.href = "/login";
+  }
+};
 
   const saveProgress = async () => {
     if (!selectedMatatu) return;
@@ -328,11 +333,18 @@ export default function OwnerDashboard() {
             </button>
           ))}
         </nav>
+        <button
+  onClick={handleLogout}
+  className="w-full mt-3 px-3 py-2 rounded-lg text-sm bg-red-600 hover:bg-red-700 text-white font-bold transition-all text-center block"
+>
+  🚪 Logout
+</button>
         <div className="mt-6 pt-4 border-t border-stone-700">
           <p className="text-xs text-stone-500 mb-1">Fleet Size</p>
           <p className="text-2xl font-black text-amber-400">{matatus.length}</p>
           <p className="text-xs text-stone-500">matatus registered</p>
         </div>
+        
       </div>
 
       {/* CONTENT */}
@@ -490,8 +502,8 @@ export default function OwnerDashboard() {
                 {matatuSavings[selectedMatatu.id] && (
                   <div className="bg-white border border-stone-200 rounded-xl p-6">
                     <div className="flex items-center gap-2 mb-1">
-                      <h3 className="font-black text-stone-700">My Savings for {selectedMatatu.plate}</h3>
-                      <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-bold">Owner deposits only</span>
+                      <h3 className="font-black text-stone-700">Matatu Savings — {selectedMatatu.plate}</h3>
+                      <span className="text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-bold">All crew + owner · approved only</span>
                     </div>
                     <p className="text-3xl font-black text-green-600 mb-3">
                       KES {matatuSavings[selectedMatatu.id]?.balance?.toLocaleString()||0}
@@ -499,7 +511,10 @@ export default function OwnerDashboard() {
                     <div className="space-y-2 max-h-40 overflow-y-auto">
                       {(matatuSavings[selectedMatatu.id]?.transactions||[]).map(t => (
                         <div key={t.id} className="flex justify-between text-sm p-2 bg-stone-50 rounded">
-                          <span className="text-stone-500">{t.description||"Deposit"} · {t.date}</span>
+                          <span className="text-stone-500">
+                            {t.description||"Deposit"} · {t.date} ·{" "}
+                            <b className="capitalize">{t.submitted_by?.name} ({t.submitted_by?.role})</b>
+                          </span>
                           <span className={`font-bold ${t.transaction_type==="deposit"?"text-green-600":"text-red-500"}`}>
                             {t.transaction_type==="deposit"?"+":"-"}KES {t.amount?.toLocaleString()}
                           </span>

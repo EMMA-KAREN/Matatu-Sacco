@@ -302,13 +302,42 @@ class LoanApplication(db.Model):
 
     is_legacy_onboarded = db.Column(db.Boolean, default=False)
 
+    security_logbook = db.Column(db.Text)
+    security_logbook_no = db.Column(db.String(50))
+    security_status = db.Column(db.String(30), default="none")   # none|required|pending_approval|held|released
+    security_notes = db.Column(db.Text)
+    loan_form_file = db.Column(db.Text)
+    insurance_file = db.Column(db.Text)
+    bank_charges_amount = db.Column(db.Float, default=0.0)
+    bank_charges_ref = db.Column(db.String(60))
+    bank_charges_method = db.Column(db.String(20))
+    requirements_status = db.Column(db.String(30), default="none")  # pending|submitted|verified|rejected
+    requirements_notes = db.Column(db.Text) 
+
      # Borrower commitment to loan type rate modifications
     rate_change_pending = db.Column(db.Boolean, default=False)
     rate_change_notes = db.Column(db.Text, nullable=True)
     rate_commitment_status = db.Column(db.String(20), default="agreed") # agreed, pending_borrower, disagreed
 
     pending_edit = db.Column(db.Text, nullable=True)
-
+    
+    # Requirements & Pre-Cheque Clearances
+    loan_form_file = db.Column(db.Text)
+    
+    insurance_file = db.Column(db.Text)                  # Proof of insurance payment
+    insurance_amount = db.Column(db.Float, default=0.0)  # Amount paid for insurance
+    insurance_ref = db.Column(db.String(60))             # Insurance M-Pesa / Bank ref
+    
+    bank_charges_amount = db.Column(db.Float, default=0.0) # Amount paid for bank recovery
+    bank_charges_ref = db.Column(db.String(60))            # Bank charges ref
+    bank_charges_method = db.Column(db.String(20))
+    bank_charges_file = db.Column(db.Text)                 # Proof of bank charges payment
+    
+    cheque_no = db.Column(db.String(60))
+    cheque_date = db.Column(db.String(30))
+    
+    requirements_status = db.Column(db.String(30), default="none")  # none|pending|submitted|verified|rejected
+    requirements_notes = db.Column(db.Text)
 
 class LoanGuarantor(db.Model):
     __tablename__ = "loan_guarantor"
@@ -498,6 +527,58 @@ class LoanLedgerEntry(db.Model):
     description = db.Column(db.String(255), nullable=True)
     date = db.Column(db.String(50), nullable=False)  # YYYY-MM-DD
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+def upload_any(file):
+    ft = file.content_type or ""
+    up = cloudinary.uploader.upload(file, resource_type="image" if "image" in ft else "raw")
+    return up["secure_url"]
+
+def notify_roles(roles, title, message, sender="SACCO System"):
+    for m in Member.query.filter(db.func.lower(Member.role).in_(roles), Member.is_active == True).all():
+        db.session.add(Notification(recipient_id=m.id, sender_name=sender, type="loan",
+                                    title=title, message=message))
+
+def generate_schedule(loan):
+    loan_type = LoanType.query.get(loan.loan_type_id)
+    freq = getattr(loan_type, "repayment_frequency", "monthly") or "monthly"
+    start_rule = getattr(loan_type, "repayment_start_rule", "next_period") or "next_period"
+    start_date = datetime.utcnow()
+    for i in range(1, loan.repayment_months + 1):
+        step = i - 1 if start_rule == "same_day" else i
+        if freq == "daily":
+            due = start_date + timedelta(days=step)
+        elif freq == "weekly":
+            due = start_date + timedelta(weeks=step)
+        else:
+            try:
+                from dateutil.relativedelta import relativedelta
+                due = start_date + relativedelta(months=step)
+            except ImportError:
+                due = start_date + timedelta(days=step * 30)
+        db.session.add(LoanRepaymentSchedule(
+            loan_id=loan.id, installment_no=i,
+            due_date=due.strftime("%Y-%m-%d"), amount_due=loan.monthly_installment))
+
+def loan_extras(l):
+    """Pre-cheque clearances and vehicle security dictionary helper."""
+    return {
+        "security_status": getattr(l, "security_status", "none") or "none",
+        "security_logbook": getattr(l, "security_logbook", None),
+        "security_logbook_no": getattr(l, "security_logbook_no", None),
+        "security_notes": getattr(l, "security_notes", None),
+        "requirements_status": getattr(l, "requirements_status", "none") or "none",
+        "requirements_notes": getattr(l, "requirements_notes", None),
+        "loan_form_file": getattr(l, "loan_form_file", None),
+        "insurance_file": getattr(l, "insurance_file", None),
+        "insurance_amount": getattr(l, "insurance_amount", 0) or 0,
+        "insurance_ref": getattr(l, "insurance_ref", None),
+        "bank_charges_amount": getattr(l, "bank_charges_amount", 0) or 0,
+        "bank_charges_ref": getattr(l, "bank_charges_ref", None),
+        "bank_charges_method": getattr(l, "bank_charges_method", None),
+        "bank_charges_file": getattr(l, "bank_charges_file", None),
+        "cheque_no": getattr(l, "cheque_no", None),
+        "cheque_date": getattr(l, "cheque_date", None),
+    }
 
 def record_ledger_entry(loan_id, member_id, transaction_type, debit_code, debit_name, credit_code, credit_name, amount, description, date=None):
     if not date:

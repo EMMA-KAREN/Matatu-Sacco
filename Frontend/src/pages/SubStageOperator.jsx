@@ -109,42 +109,37 @@ export default function SubStageOperator() {
     m.plate?.toLowerCase().includes(matatuSearch.toLowerCase())
   );
 
-  const handleRouteChange = (routeId) => {
-    const route = routes.find(r => r.id === parseInt(routeId));
-    if (route) {
-      setForm(f => ({
-        ...f,
-        route_id: route.id,
-        from_stage: route.from_stage,
-        to_stage: route.to_stage,
-        shimo_fee: route.shimo_fee || 100
-      }));
-    } else {
-      setForm(f => ({ ...f, route_id: "", from_stage: "Sub-Branch Stage", to_stage: "", shimo_fee: "100" }));
-    }
-  };
+  // 1. Keep operator's entered fee on route change
+const handleRouteChange = (routeId) => {
+  const route = routes.find(r => r.id === parseInt(routeId));
+  setForm(f => route
+    ? { ...f, route_id: route.id, from_stage: route.from_stage, to_stage: route.to_stage }
+    : { ...f, route_id: "", from_stage: "Sub-Branch Stage", to_stage: "" }
+  );
+};
 
-  const selectMatatu = (matatu) => {
-    const cleanPlate = (matatu.plate || "").trim().toUpperCase();
-    setMatatuSearch(cleanPlate);
-    setShowMatatuDrop(false);
+// 2. In selectMatatu, do NOT overwrite the operator's fee
+const selectMatatu = (matatu) => {
+  const cleanPlate = (matatu.plate || "").trim().toUpperCase();
+  setMatatuSearch(cleanPlate);
+  setShowMatatuDrop(false);
 
-    const targetRoute = routes.find(r => r.id === parseInt(form.route_id || matatu.route_id)) || routes[0];
+  const targetRoute = routes.find(r => r.id === parseInt(form.route_id || matatu.route_id)) || routes[0];
 
-    setForm(f => ({
-      ...f,
-      matatu_id: matatu.id,
-      plate: cleanPlate,
-      owner_name: matatu.owner_member_no || "",
-      capacity: matatu.capacity || "",
-      route_id: targetRoute ? targetRoute.id : f.route_id,
-      from_stage: targetRoute ? targetRoute.from_stage : f.from_stage,
-      to_stage: targetRoute ? targetRoute.to_stage : f.to_stage,
-      shimo_fee: targetRoute ? (targetRoute.shimo_fee || 100) : "100"
-    }));
+  setForm(f => ({
+    ...f,
+    matatu_id: matatu.id,
+    plate: cleanPlate,
+    owner_name: matatu.owner_member_no || "",
+    capacity: matatu.capacity || "",
+    route_id: targetRoute ? targetRoute.id : f.route_id,
+    from_stage: targetRoute ? targetRoute.from_stage : f.from_stage,
+    to_stage: targetRoute ? targetRoute.to_stage : f.to_stage
+    // Notice: shimo_fee is preserved
+  }));
 
-    showToast(`✅ ${cleanPlate} selected for Sub-Branch clearance`, "success");
-  };
+  showToast(`✅ ${cleanPlate} selected for Sub-Branch clearance`, "success");
+};
 
   const saveDraft = async () => {
     if (!form.matatu_id || !form.route_id || !form.mode_of_payment) {
@@ -189,60 +184,62 @@ export default function SubStageOperator() {
     showToast("Draft updated ✓");
   };
 
-  const submitReceipt = async () => {
-    if (!draft?.id) return showToast("Save a draft first", "error");
-    if (!window.confirm("Submit this receipt? The fee is credited directly to Sub-Branch Welfare Pool.")) return;
+  // 3. Dynamic submit prompt
+const submitReceipt = async () => {
+  if (!draft?.id) return showToast("Save a draft first", "error");
+  if (!window.confirm(`Submit this receipt? KES ${form.shimo_fee} is credited directly to Sub-Branch Welfare Pool.`)) return;
 
-    const res = await fetch(`${API}/receipts/${draft.id}/submit`, { method: "PUT", headers });
-    if (!res.ok) { const d = await res.json(); return showToast(d.error || "Submit failed", "error"); }
-    setSubmitted(true);
-    showToast("Receipt submitted & welfare credited ✓");
-    fetchReceipts();
-  };
+  const res = await fetch(`${API}/receipts/${draft.id}/submit`, { method: "PUT", headers });
+  if (!res.ok) { const d = await res.json(); return showToast(d.error || "Submit failed", "error"); }
+  setSubmitted(true);
+  showToast("Receipt submitted & welfare credited ✓");
+  fetchReceipts();
+};
 
-  const resetForm = () => {
-    setDraft(null); setSubmitted(false); setMatatuSearch("");
-    fetchMatatusList();
-    setForm({
-      sacco_name: saccoSettings.sacco_name || "2KM SACCO", matatu_id: "", plate: "", owner_name: "",
-      route_id: "", from_stage: "Sub-Branch Stage", to_stage: "", shimo_fee: "100", capacity: "",
-      mode_of_payment: "Cash", date_issued: new Date().toISOString().split("T")[0],
-      operator_membership_no: user?.membership_no || ""
-    });
-  };
+// 4. In resetForm, preserve the operator's fee
+const resetForm = () => {
+  setDraft(null); setSubmitted(false); setMatatuSearch("");
+  fetchMatatusList();
+  setForm(f => ({
+    sacco_name: saccoSettings.sacco_name || "2KM SACCO", matatu_id: "", plate: "", owner_name: "",
+    route_id: "", from_stage: "Sub-Branch Stage", to_stage: "",
+    shimo_fee: f.shimo_fee || "100", 
+    capacity: "",
+    mode_of_payment: "Cash", date_issued: new Date().toISOString().split("T")[0],
+    operator_membership_no: user?.membership_no || ""
+  }));
+};
 
   // ── SLIP PRINTING: FULL SACCO DETAILS INCLUDED & SHIMO FEE REMOVED ──
   const printReceipt = (r) => {
     const win = window.open("", "_blank");
     win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
-      <style>
-        body{font-family:monospace;padding:20px;max-width:380px;margin:auto;}
-        h2{text-align:center;margin-bottom:2px;}
-        .meta{text-align:center;font-size:11px;color:#444;margin-bottom:12px;line-height:1.5;}
-        .line{display:flex;justify-content:space-between;margin:6px 0;border-bottom:1px dashed #ddd;padding-bottom:4px;font-size:13px;}
-        .ticket{text-align:center;font-size:18px;font-weight:bold;margin:14px 0;background:#f4f4f4;padding:6px;border-radius:4px;}
-        .highlight{font-weight:bold;color:#000;font-size:14px;}
-        .footer{text-align:center;margin-top:20px;font-size:11px;color:#666;line-height:1.4;}
-      </style></head>
-      <body>
-        <h2>${r.sacco_name || saccoSettings.sacco_name || "2KM SACCO"}</h2>
-        <div class="meta">
-          <div>📍 Address: ${r.location || saccoSettings.location || "Nairobi"}</div>
-          <div>📬 PO Box: ${r.po_box || saccoSettings.po_box || "P.o.box 90300"}</div>
-          <div>📞 Hotline: ${r.phone_number || saccoSettings.phone_number || "+254110928525"}</div>
-        </div>
-        <div class="ticket">🎫 ${r.ticket_number}</div>
-        <div class="line"><span>Vehicle Plate:</span><span class="highlight">${r.plate}</span></div>
-        <div class="line"><span>Owner Member:</span><span>${r.owner_name || "N/A"}</span></div>
-        <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
-        <div class="line"><span>Date Issued:</span><span>${r.date_issued}</span></div>
-        <div class="line"><span>Time Issued:</span><span>${r.time_issued || ""}</span></div>
-        <div class="line"><span>Operator No:</span><span>${r.operator_membership_no || user?.membership_no || "Sub-Branch"}</span></div>
-        <div class="footer">
-          *** Sub-Branch Operational Entry Slip ***<br/>
-          Validated for Stage Dispatch
-        </div>
-      </body></html>`);
+  <style>
+    @page { size: 58mm auto; margin: 0; }
+    html, body { margin: 0; padding: 0; }
+    body { font-family: monospace; width: 48mm; padding: 1mm 2mm; font-size: 9px; line-height: 1.15; color: #000; }
+    h2 { font-size: 11px; text-align: center; margin: 0; }
+    .meta { text-align: center; font-size: 8px; margin: 0 0 2px; line-height: 1.1; }
+    .ticket { text-align: center; font-size: 10px; font-weight: bold; margin: 2px 0; padding: 1px 0; border: 1px solid #000; white-space: nowrap; }
+    .line { display: flex; justify-content: space-between; gap: 4px; margin: 1px 0; padding-bottom: 1px; border-bottom: 1px dashed #999; font-size: 9px; }
+    .line span:last-child { text-align: right; }
+    .highlight { font-weight: bold; }
+    .footer { text-align: center; margin-top: 3px; font-size: 8px; line-height: 1.1; }
+  </style></head>
+  <body>
+    <h2>${r.sacco_name || saccoSettings.sacco_name || "2KM SACCO"}</h2>
+    <div class="meta">
+      ${r.location || saccoSettings.location || "Nairobi"} | PO Box: ${r.po_box || saccoSettings.po_box || ""}<br/>
+      Tel: ${r.phone_number || saccoSettings.phone_number || ""}
+    </div>
+    <div class="ticket">${r.ticket_number}</div>
+    <div class="line"><span>Plate:</span><span class="highlight">${r.plate}</span></div>
+    <div class="line"><span>Owner:</span><span>${r.owner_name || "N/A"}</span></div>
+    <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
+    <div class="line"><span>${r.date_issued}</span><span>${r.time_issued || ""}</span></div>
+    <div class="line"><span>Operator:</span><span>${r.operator_membership_no || user?.membership_no || "Sub-Branch"}</span></div>
+    <div class="footer">*** Sub-Branch Entry Slip ***<br/>Validated for Stage Dispatch</div>
+  </body></html>`);
     win.document.close();
     setTimeout(() => win.print(), 500);
   };
@@ -368,12 +365,20 @@ export default function SubStageOperator() {
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-sm font-medium text-gray-700">Sub-Stage Fee (KES)</label>
-                  <input type="number" value={form.shimo_fee} onChange={e => setForm({...form, shimo_fee: e.target.value})}
-                    className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-purple-700 font-bold" disabled={submitted} />
-                  <p className="text-[10px] text-purple-600 font-bold mt-1">100% routed to Sub-Branch Welfare Pool</p>
-                </div>
+             <div>
+  <label className="text-sm font-medium text-gray-700">Sub-Stage Fee (KES)</label>
+  <input 
+    type="number" 
+    value={form.shimo_fee} 
+    onChange={e => setForm({ ...form, shimo_fee: e.target.value })}
+    placeholder="Enter fee amount"
+    className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-purple-700 font-bold outline-none focus:border-purple-500" 
+    disabled={submitted} 
+  />
+  <p className="text-[10px] text-purple-600 font-bold mt-1">
+    100% of KES {form.shimo_fee || 0} routed to Sub-Branch Welfare Pool
+  </p>
+</div>
                 <div>
                   <label className="text-sm font-medium text-gray-700">Capacity</label>
                   <input type="number" value={form.capacity} onChange={e => setForm({...form, capacity: e.target.value})}

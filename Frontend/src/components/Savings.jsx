@@ -13,9 +13,10 @@ const PAYMENT_METHODS = [
 
 export default function Savings() {
   const { user } = useAuth();
-  const [activeSubTab, setActiveSubTab] = useState("dashboard"); // 'dashboard', 'history', 'desk', 'reports', 'matatuOversight'
-  
+  const [activeSubTab, setActiveSubTab] = useState("dashboard"); // 'dashboard', 'history', 'desk', 'matatuOversight', 'matatuPool', 'reports'
+
   const [personalBalance, setPersonalBalance] = useState(0);
+  const [matatuContributed, setMatatuContributed] = useState(0);
   const [personalHistory, setPersonalHistory] = useState([]);
   const [matatus, setMatatus] = useState([]);
   const [members, setMembers] = useState([]);
@@ -25,6 +26,7 @@ export default function Savings() {
 
   const isAdministrativeRole = ["hr", "admin", "director"].includes(user?.role);
   const isAdminOrDirector = ["admin", "director"].includes(user?.role);
+  const isCrewOrOwner = ["driver", "conductor", "owner"].includes(user?.role);
 
   // Deposit Form State (For normal members: Drivers, Conductors, Owners)
   const [depositForm, setDepositForm] = useState({
@@ -71,8 +73,17 @@ export default function Savings() {
   // Matatu Savings list for Admin Oversight
   const [matatuSavingsAdmin, setMatatuSavingsAdmin] = useState([]);
 
+  // Matatu savings pool (driver / conductor / owner view)
+  const [poolMatatuId, setPoolMatatuId] = useState("");
+  const [matatuPool, setMatatuPool] = useState(null);
+
   const token = localStorage.getItem("token");
   const headers = { Authorization: `Bearer ${token}` };
+
+  const plateOf = (id) => {
+    const m = matatus.find((x) => x.id === id);
+    return m ? m.plate : `#${id}`;
+  };
 
   const triggerToast = (msg, isError = false) => {
     if (isError) {
@@ -91,7 +102,8 @@ export default function Savings() {
       const res = await fetch(`${API}/savings/my`, { headers });
       if (res.ok) {
         const data = await res.json();
-        setPersonalBalance(data.balance || 0);
+        setPersonalBalance(data.balance || 0);          // personal only, approved only
+        setMatatuContributed(data.matatu_contributed || 0); // info only
         setPersonalHistory(data.transactions || []);
       }
     } catch (e) {
@@ -130,6 +142,14 @@ export default function Savings() {
     } catch (e) {}
   }, [isAdminOrDirector]);
 
+  const fetchMatatuPool = useCallback(async (id) => {
+    if (!id) return;
+    try {
+      const res = await fetch(`${API}/savings/matatu/${id}`, { headers });
+      if (res.ok) setMatatuPool(await res.json());
+    } catch (e) {}
+  }, []);
+
   const fetchReport = useCallback(async () => {
     setLoading(true);
     let url = `${API}/savings/reports?period=${reportPeriod}`;
@@ -155,6 +175,18 @@ export default function Savings() {
       fetchMatatuSavingsAdmin();
     }
   }, [fetchMySavings, fetchMatatus, fetchMembers, fetchPendingSavings, fetchMatatuSavingsAdmin, isAdministrativeRole, isAdminOrDirector]);
+
+  // Default the pool view to the first matatu available to this user
+  useEffect(() => {
+    if (isCrewOrOwner && matatus.length && !poolMatatuId) {
+      setPoolMatatuId(String(matatus[0].id));
+    }
+  }, [matatus, isCrewOrOwner, poolMatatuId]);
+
+  // Load the pool when the tab is opened or the matatu changes
+  useEffect(() => {
+    if (poolMatatuId && activeSubTab === "matatuPool") fetchMatatuPool(poolMatatuId);
+  }, [poolMatatuId, activeSubTab, fetchMatatuPool]);
 
   const handleDepositSubmit = async (e) => {
     e.preventDefault();
@@ -182,7 +214,11 @@ export default function Savings() {
         body: fd
       });
       if (res.ok) {
-        triggerToast("Savings request successfully queued! Verified money will reflect after Sacco clearance.");
+        triggerToast(
+          depositForm.matatu_id
+            ? "Matatu savings request queued! It will appear in the matatu account after final Admin approval."
+            : "Savings request successfully queued! Verified money will reflect after Sacco clearance."
+        );
         setDepositForm({
           amount: "", payment_method: "paybill", mpesa_code: "",
           description: "", date: new Date().toISOString().split("T")[0],
@@ -244,7 +280,7 @@ export default function Savings() {
   const handleSendPrompt = async (e) => {
     e.preventDefault();
     if (!promptForm.member_id) return triggerToast("Select a member first", true);
-    
+
     setLoading(true);
     try {
       const res = await fetch(`${API}/savings/prompt`, {
@@ -288,6 +324,7 @@ export default function Savings() {
         fetchPendingSavings();
         fetchMatatuSavingsAdmin();
         fetchMySavings();
+        if (poolMatatuId) fetchMatatuPool(poolMatatuId);
       } else {
         const err = await res.json();
         triggerToast(err.error || "Final approval failed", true);
@@ -313,9 +350,9 @@ export default function Savings() {
 
   const exportCSV = () => {
     if (!reportData || !reportData.transactions.length) return;
-    let csv = "ID,Member ID,Amount (KES),Type,Method,Ref Code,Date,Description\n";
+    let csv = "ID,Member ID,Matatu ID,Amount (KES),Type,Method,Ref Code,Date,Description\n";
     reportData.transactions.forEach((t) => {
-      csv += `${t.id},${t.member_id},${t.amount},${t.transaction_type},${t.payment_method},${t.mpesa_code},${t.date},"${t.description}"\n`;
+      csv += `${t.id},${t.member_id},${t.matatu_id || ""},${t.amount},${t.transaction_type},${t.payment_method},${t.mpesa_code},${t.date},"${t.description}"\n`;
     });
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
@@ -326,22 +363,34 @@ export default function Savings() {
 
   return (
     <div className="p-6 bg-slate-900 min-h-screen text-slate-100 font-sans rounded-2xl border border-slate-800">
-      
+
+      {/* Toasts */}
+      {(errorMessage || successMessage) && (
+        <div
+          className={`fixed top-5 right-5 z-[60] max-w-sm px-5 py-3 rounded-xl shadow-2xl text-xs font-bold ${
+            errorMessage ? "bg-red-500 text-white" : "bg-emerald-500 text-slate-950"
+          }`}
+        >
+          {errorMessage || successMessage}
+        </div>
+      )}
+
       <div className="max-w-6xl mx-auto space-y-6">
-        
+
         {/* Module Header */}
         <div className="flex flex-col md:flex-row md:items-center md:justify-between border-b border-slate-800 pb-5">
           <div>
             <h1 className="text-3xl font-black tracking-tight text-white">🏦 Sacco Savings Portfolio</h1>
             <p className="text-xs text-slate-400 mt-1">Manage, verify, and generate certified weekly, monthly, and yearly statements.</p>
           </div>
-          
+
           <div className="mt-4 md:mt-0 flex flex-wrap gap-1 bg-slate-800 p-1 rounded-xl">
             {[
               { key: "dashboard", label: "📊 Dashboard" },
               { key: "history", label: "🕒 My History" },
               { key: "desk", label: "🛡️ Approvals Desk", roles: ["hr", "admin", "director"] },
               { key: "matatuOversight", label: "🚐 Matatu Audit Desk", roles: ["admin", "director"] },
+              { key: "matatuPool", label: "🚐 Matatu Savings", roles: ["driver", "conductor", "owner"] },
               { key: "reports", label: "📋 Reports Engine" }
             ].map((t) => {
               if (t.roles && !t.roles.includes(user?.role)) return null;
@@ -365,15 +414,21 @@ export default function Savings() {
         {/* ==================================================================== */}
         {activeSubTab === "dashboard" && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            
+
             <div className="lg:col-span-1 space-y-6">
               {!isAdministrativeRole ? (
                 <div className="bg-gradient-to-br from-emerald-800 to-teal-900 border border-emerald-600/30 rounded-2xl p-6 shadow-xl text-white">
-                  <span className="text-emerald-300 text-xs font-bold uppercase tracking-wider block">Your Contributions Balance</span>
+                  <span className="text-emerald-300 text-xs font-bold uppercase tracking-wider block">Your Personal Savings Balance</span>
                   <p className="text-4xl font-extrabold tracking-tight mt-1">KES {personalBalance.toLocaleString()}</p>
                   <div className="mt-4 p-3 bg-emerald-950/40 rounded-xl border border-emerald-500/20 text-[11px] leading-relaxed text-emerald-100">
-                    🛡️ This balance only reflects contributions fully approved and cleared by Sacco Administration.
+                    🛡️ This balance only reflects your personal contributions fully approved and cleared by Sacco Administration. Money saved to a matatu is not counted here.
                   </div>
+                  {isCrewOrOwner && matatuContributed !== 0 && (
+                    <div className="mt-3 p-3 bg-blue-950/40 rounded-xl border border-blue-500/20 text-[11px] text-blue-100">
+                      🚐 Contributed to matatu accounts (approved): <b>KES {matatuContributed.toLocaleString()}</b>
+                      <span className="block text-blue-300/80">Held in the matatu's savings account, not your personal balance.</span>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="bg-slate-800 border border-slate-700 rounded-2xl p-6 shadow-xl text-slate-300 text-center">
@@ -389,16 +444,16 @@ export default function Savings() {
                 <div className="space-y-3 text-[11px]">
                   <div className="border-b border-slate-700/50 pb-2">
                     <p className="text-slate-400 font-bold">M-Pesa Buy Goods Till</p>
-                    <p className="text-white font-mono text-sm mt-0.5">Till Number: <span className="text-emerald-400 font-bold">590123</span></p>
+                    <p className="text-white font-mono text-sm mt-0.5">Till Number: <span className="text-emerald-400 font-bold">..</span></p>
                   </div>
                   <div className="border-b border-slate-700/50 pb-2">
                     <p className="text-slate-400 font-bold">M-Pesa Paybill</p>
-                    <p className="text-white font-mono text-sm mt-0.5">Business No: <span className="text-emerald-400 font-bold">222999</span></p>
+                    <p className="text-white font-mono text-sm mt-0.5">Business No: <span className="text-emerald-400 font-bold">..</span></p>
                     <p className="text-slate-500">Account No: [Your Membership Number]</p>
                   </div>
                   <div>
                     <p className="text-slate-400 font-bold">Equity Bank Sacco Shares Account</p>
-                    <p className="text-white font-mono mt-0.5">Account: <span className="text-emerald-400 font-bold">0110293481234</span></p>
+                    <p className="text-white font-mono mt-0.5">Account: <span className="text-emerald-400 font-bold">..</span></p>
                   </div>
                 </div>
               </div>
@@ -409,8 +464,8 @@ export default function Savings() {
               {!isAdministrativeRole ? (
                 <form onSubmit={handleDepositSubmit} className="bg-slate-800 rounded-2xl border border-slate-700 p-6 space-y-4 shadow-xl">
                   <h3 className="font-black text-lg text-white">💰 Lodge Savings Deposit</h3>
-                  <p className="text-xs text-slate-400">Add personal savings or route them directly to your assigned matatu fleet.</p>
-                  
+                  <p className="text-xs text-slate-400">Save to your personal account, or route the money to your assigned matatu's savings account.</p>
+
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
                       <label className="text-xs text-slate-400 block mb-1">Amount (KES)</label>
@@ -455,17 +510,22 @@ export default function Savings() {
                       />
                     </div>
                     <div>
-                      <label className="text-xs text-slate-400 block mb-1">Assign to Fleet Vehicle (Optional)</label>
+                      <label className="text-xs text-slate-400 block mb-1">Save To</label>
                       <select
                         value={depositForm.matatu_id}
                         onChange={(e) => setDepositForm({ ...depositForm, matatu_id: e.target.value })}
                         className="w-full bg-slate-900 border border-slate-700 rounded-xl p-3 text-sm text-white focus:border-emerald-500 outline-none"
                       >
-                        <option value="">Personal savings (No Vehicle)</option>
+                        <option value="">Personal savings (my own account)</option>
                         {matatus.map((m) => (
-                          <option key={m.id} value={m.id}>🚐 {m.plate}</option>
+                          <option key={m.id} value={m.id}>🚐 {m.plate} (matatu account)</option>
                         ))}
                       </select>
+                      {depositForm.matatu_id && (
+                        <p className="text-[10px] text-amber-400 mt-1">
+                          This goes to the matatu's savings account (visible to the owner), not your personal balance.
+                        </p>
+                      )}
                     </div>
                     <div>
                       <label className="text-xs text-slate-400 block mb-1">Description</label>
@@ -517,13 +577,13 @@ export default function Savings() {
               <h3 className="font-extrabold text-sm text-white">🕒 Sacco Statement Ledger History</h3>
               <span className="text-xs bg-slate-800 text-slate-400 px-3 py-1 rounded-full font-bold">Total: {personalHistory.length} transactions</span>
             </div>
-            
+
             <div className="overflow-x-auto">
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-900 text-slate-300">
                   <tr>
                     <th className="p-3">Reference/M-Pesa</th>
-                    <th className="p-3">Sacco Matatu</th>
+                    <th className="p-3">Saved To</th>
                     <th className="p-3">Method</th>
                     <th className="p-3">Amount</th>
                     <th className="p-3">Date</th>
@@ -544,7 +604,9 @@ export default function Savings() {
                     personalHistory.map((h) => (
                       <tr key={h.id} className="hover:bg-slate-700/30">
                         <td className="p-3 font-bold font-mono text-emerald-400">{h.mpesa_code || "N/A"}</td>
-                        <td className="p-3 text-slate-300 font-bold">{h.matatu_id ? `#${h.matatu_id}` : "Personal"}</td>
+                        <td className="p-3 text-slate-300 font-bold">
+                          {h.matatu_id ? `🚐 ${plateOf(h.matatu_id)}` : "Personal"}
+                        </td>
                         <td className="p-3 capitalize text-slate-400">{h.payment_method}</td>
                         <td className="p-3 font-black text-white text-sm">KES {h.amount?.toLocaleString()}</td>
                         <td className="p-3 text-slate-400">{h.date}</td>
@@ -578,20 +640,20 @@ export default function Savings() {
         {/* ==================================================================== */}
         {activeSubTab === "desk" && (
           <div className="space-y-6">
-            
+
             {/* Multi-tier pending approvals queue */}
             <div className="bg-slate-800 rounded-2xl border border-slate-700 overflow-hidden shadow-xl">
               <div className="px-6 py-4 bg-slate-700/50 border-b border-slate-700 flex justify-between items-center">
                 <h3 className="font-extrabold text-sm text-white">🔍 Verification Approval Queue</h3>
                 <span className="text-xs bg-slate-900 text-emerald-400 px-3 py-1 rounded-full font-bold">{pendingSavings.length} items needing action</span>
               </div>
-              
+
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-900 text-slate-300">
                     <tr>
                       <th className="p-3">Member</th>
-                      <th className="p-3">Matatu ID</th>
+                      <th className="p-3">Saved To</th>
                       <th className="p-3">Amount</th>
                       <th className="p-3">Reference/M-Pesa</th>
                       <th className="p-3">Channel</th>
@@ -617,7 +679,9 @@ export default function Savings() {
                               <p className="font-bold text-white">{item.member_name}</p>
                               <p className="text-[10px] text-slate-400 font-mono">{item.membership_no}</p>
                             </td>
-                            <td className="p-3 text-slate-300 font-bold">{item.matatu_id ? `#${item.matatu_id}` : "Personal"}</td>
+                            <td className="p-3 text-slate-300 font-bold">
+                              {item.matatu_id ? `🚐 ${plateOf(item.matatu_id)}` : "Personal"}
+                            </td>
                             <td className="p-3 font-extrabold text-white text-sm">KES {item.amount?.toLocaleString()}</td>
                             <td className="p-3 font-mono text-emerald-400 font-bold">{item.mpesa_code || "N/A"}</td>
                             <td className="p-3 capitalize text-slate-300">{item.payment_method}</td>
@@ -655,7 +719,7 @@ export default function Savings() {
                                   Approve Contribution
                                 </button>
                               )}
-                              
+
                               <button
                                 onClick={() => handleReject(item.id)}
                                 className="bg-red-600/80 hover:bg-red-500 text-white text-[10px] px-2.5 py-1.5 rounded-lg font-bold"
@@ -674,14 +738,14 @@ export default function Savings() {
 
             {/* Overrides and prompts forms panels */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              
+
               {/* HR / Admin Manual Override Form */}
               <div className="bg-slate-800 rounded-2xl border border-slate-700 p-5 space-y-4 shadow-xl">
                 <div className="border-b border-slate-700 pb-2">
                   <h3 className="font-extrabold text-white text-sm">🛠️ Sacco Manual Deposit Override</h3>
                   <p className="text-[11px] text-slate-400 mt-0.5">Logs manual contribution for a member. Mandates proof upload and requires Admin final sign-off.</p>
                 </div>
-                
+
                 <form onSubmit={handleHrManualSubmit} className="space-y-3">
                   <div className="relative">
                     <label className="text-[11px] text-slate-400 block mb-1">Select Sacco Member</label>
@@ -811,8 +875,8 @@ export default function Savings() {
                     disabled={loading}
                     className="w-full bg-blue-600 hover:bg-blue-500 text-white font-black py-2.5 rounded-xl transition-all text-xs"
                   >
-                    {isAdminOrDirector 
-                      ? "💾 DIRECT DEPOSIT FOR ADMIN CONFIRMATION" 
+                    {isAdminOrDirector
+                      ? "💾 DIRECT DEPOSIT FOR ADMIN CONFIRMATION"
                       : "💾 RECORD CONTRIBUTION & FORWARD TO ADMIN SIGN-OFF"
                     }
                   </button>
@@ -896,10 +960,10 @@ export default function Savings() {
           <div className="bg-slate-800 rounded-2xl border border-slate-700 overflow-hidden shadow-xl space-y-4">
             <div className="px-6 py-4 bg-slate-700/50 border-b border-slate-700 flex justify-between items-center">
               <div>
-                <h3 className="font-black text-sm text-white">🚐 fleet Matatu Savings Oversight Desk</h3>
+                <h3 className="font-black text-sm text-white">🚐 Fleet Matatu Savings Oversight Desk</h3>
                 <p className="text-[10px] text-slate-400 mt-0.5">Inspects matatu-bound entries logged by drivers, conductors, and overrides to detect fraud.</p>
               </div>
-              <button 
+              <button
                 onClick={fetchMatatuSavingsAdmin}
                 className="bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-200 text-xs px-3 py-1.5 rounded-lg"
               >
@@ -940,7 +1004,7 @@ export default function Savings() {
                             m.status === "rejected" ? "bg-red-950 text-red-400" :
                             "bg-amber-950 text-amber-400"
                           }`}>
-                            {m.status}
+                            {m.status?.replace("_", " ")}
                           </span>
                         </td>
                       </tr>
@@ -953,16 +1017,127 @@ export default function Savings() {
         )}
 
         {/* ==================================================================== */}
-        {/* SUBTAB 5: REPORTS ENGINE */}
+        {/* SUBTAB 5: MATATU SAVINGS POOL (driver / conductor / owner) */}
+        {/* ==================================================================== */}
+        {activeSubTab === "matatuPool" && isCrewOrOwner && (
+          <div className="space-y-6">
+
+            {/* Matatu selector */}
+            <div className="bg-slate-800 rounded-2xl border border-slate-700 p-5 flex flex-wrap gap-2 items-center shadow-xl">
+              <span className="text-xs text-slate-400 mr-2">Matatu:</span>
+              {matatus.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => setPoolMatatuId(String(m.id))}
+                  className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${
+                    String(m.id) === poolMatatuId
+                      ? "bg-emerald-500 text-slate-950"
+                      : "bg-slate-900 text-slate-300 hover:bg-slate-700"
+                  }`}
+                >
+                  🚐 {m.plate}
+                </button>
+              ))}
+              {matatus.length === 0 && <span className="text-xs text-slate-500">No matatu assigned.</span>}
+              {poolMatatuId && (
+                <button
+                  onClick={() => fetchMatatuPool(poolMatatuId)}
+                  className="ml-auto bg-slate-900 border border-slate-700 hover:bg-slate-800 text-slate-200 text-xs px-3 py-1.5 rounded-lg"
+                >
+                  🔄 Refresh
+                </button>
+              )}
+            </div>
+
+            {matatuPool && (
+              <>
+                {/* Balance card */}
+                <div className="bg-gradient-to-br from-blue-800 to-indigo-900 border border-blue-600/30 rounded-2xl p-6 text-white shadow-xl">
+                  <span className="text-blue-300 text-xs font-bold uppercase tracking-wider block">
+                    Matatu Savings Balance (approved only)
+                  </span>
+                  <p className="text-4xl font-extrabold tracking-tight mt-1">
+                    KES {(matatuPool.balance || 0).toLocaleString()}
+                  </p>
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    {(matatuPool.by_contributor || []).map((c) => (
+                      <span key={c.name} className="text-[11px] bg-blue-950/50 px-3 py-1 rounded-full capitalize">
+                        {c.name} ({c.role}): KES {c.total.toLocaleString()}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-[11px] text-blue-200/80 mt-3">
+                    🛡️ Only deposits that received final Admin approval appear here. This is the matatu's money, not anyone's personal savings.
+                  </p>
+                </div>
+
+                {/* Transactions */}
+                <div className="bg-slate-800 rounded-2xl border border-slate-700 overflow-hidden shadow-xl">
+                  <div className="px-6 py-4 bg-slate-700/50 border-b border-slate-700">
+                    <h3 className="font-extrabold text-sm text-white">🚐 Matatu Savings Ledger</h3>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs">
+                      <thead className="bg-slate-900 text-slate-300">
+                        <tr>
+                          <th className="p-3">Date</th>
+                          <th className="p-3">Saved By</th>
+                          <th className="p-3">Method</th>
+                          <th className="p-3">Ref</th>
+                          <th className="p-3">Amount</th>
+                          <th className="p-3">Proof</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-700">
+                        {(matatuPool.transactions || []).length === 0 ? (
+                          <tr>
+                            <td colSpan="6" className="p-8 text-center text-slate-500 font-bold">
+                              No approved matatu savings yet.
+                            </td>
+                          </tr>
+                        ) : (
+                          matatuPool.transactions.map((t) => (
+                            <tr key={t.id} className="hover:bg-slate-700/30">
+                              <td className="p-3 text-slate-400">{t.date}</td>
+                              <td className="p-3 text-white font-bold">
+                                {t.submitted_by?.name || "Unknown"}{" "}
+                                <span className="text-slate-500 capitalize font-normal">({t.submitted_by?.role})</span>
+                              </td>
+                              <td className="p-3 capitalize text-slate-400">{t.payment_method}</td>
+                              <td className="p-3 font-mono text-emerald-400">{t.mpesa_code || "—"}</td>
+                              <td className="p-3 font-black text-white">
+                                {t.transaction_type === "deposit" ? "+" : "-"}KES {t.amount?.toLocaleString()}
+                              </td>
+                              <td className="p-3">
+                                {t.proof_file ? (
+                                  <a href={t.proof_file} target="_blank" rel="noreferrer" className="text-blue-400 underline font-bold">
+                                    Open
+                                  </a>
+                                ) : <span className="text-slate-600">—</span>}
+                              </td>
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ==================================================================== */}
+        {/* SUBTAB 6: REPORTS ENGINE */}
         {/* ==================================================================== */}
         {activeSubTab === "reports" && (
           <div className="space-y-6">
-            
+
             {/* Filter and options panel */}
             <div className="bg-slate-800 rounded-2xl border border-slate-700 p-5 shadow-xl">
               <h3 className="font-extrabold text-sm text-white mb-3">📋 Certified Sacco Reports Parameter Filters</h3>
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4 items-end text-xs">
-                
+
                 <div>
                   <label className="text-slate-400 block mb-1">Timeframe Period</label>
                   <select
@@ -1031,7 +1206,7 @@ export default function Savings() {
             {/* Generated Report output */}
             {reportData ? (
               <div id="print-area" className="bg-slate-800 rounded-2xl border border-slate-700 p-6 shadow-xl text-slate-100 print:bg-white print:text-black">
-                
+
                 {/* Print layout branding */}
                 <div className="text-center border-b border-slate-700 pb-5 mb-5 space-y-1">
                   <h2 className="text-2xl font-black text-white print:text-black">2KM SACCO</h2>
@@ -1062,6 +1237,7 @@ export default function Savings() {
                       <tr>
                         <th className="p-3">Reference</th>
                         <th className="p-3">Category</th>
+                        <th className="p-3">Saved To</th>
                         <th className="p-3">Method</th>
                         <th className="p-3">Amount</th>
                         <th className="p-3">Date</th>
@@ -1071,13 +1247,14 @@ export default function Savings() {
                     <tbody className="divide-y divide-slate-700 print:divide-black">
                       {reportData.transactions.length === 0 ? (
                         <tr>
-                          <td colSpan="6" className="p-5 text-center text-slate-500 font-bold">No processed logs match this filter period.</td>
+                          <td colSpan="7" className="p-5 text-center text-slate-500 font-bold">No processed logs match this filter period.</td>
                         </tr>
                       ) : (
                         reportData.transactions.map((t) => (
                           <tr key={t.id} className="hover:bg-slate-700/30">
                             <td className="p-3 font-mono font-bold text-emerald-400 print:text-black">{t.mpesa_code || "N/A"}</td>
                             <td className="p-3 capitalize font-bold text-slate-300 print:text-black">{t.transaction_type}</td>
+                            <td className="p-3 text-slate-300 print:text-black">{t.matatu_id ? `🚐 ${plateOf(t.matatu_id)}` : "Personal"}</td>
                             <td className="p-3 capitalize text-slate-400 print:text-black">{t.payment_method}</td>
                             <td className={`p-3 font-black text-sm ${t.transaction_type === "deposit" ? "text-emerald-400" : "text-red-400"} print:text-black`}>
                               {t.transaction_type === "deposit" ? "+" : "-"}KES {t.amount?.toLocaleString()}
