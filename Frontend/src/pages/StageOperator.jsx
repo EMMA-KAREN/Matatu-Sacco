@@ -10,6 +10,14 @@ const TABS = [
   { key: "stageOperations",  label: "🛡️ Stage & Expenses" }, 
 ];
 
+// Helper for local date (YYYY-MM-DD) avoiding UTC midnight timezone rollback in Kenya
+const getTodayDate = () => {
+  const d = new Date();
+  const offset = d.getTimezoneOffset();
+  const local = new Date(d.getTime() - offset * 60 * 1000);
+  return local.toISOString().split("T")[0];
+};
+
 function Toast({ msg, type, onClose }) {
   useEffect(() => { const t = setTimeout(onClose, 3500); return () => clearTimeout(t); }, [onClose]);
   return (
@@ -49,23 +57,23 @@ export default function StageOperator() {
   const [form, setForm] = useState({
     sacco_name: "2KM SACCO", matatu_id:"", plate:"", owner_name:"",
     route_id:"", from_stage:"", to_stage:"", shimo_fee:"", capacity:"",
-    mode_of_payment:"Cash", date_issued: new Date().toISOString().split("T")[0],
+    mode_of_payment:"Cash", date_issued: getTodayDate(),
     operator_membership_no: user?.membership_no || ""
   });
 
   // ── Receipts list ──
   const [receipts, setReceipts]     = useState([]);
-  const [filterDate, setFilterDate] = useState(new Date().toISOString().split("T")[0]);
+  const [filterDate, setFilterDate] = useState(getTodayDate());
 
   // ── Daily summary & Vehicle Tracker State ──
   const [showSummary, setShowSummary]       = useState(false);
-  const [summaryDate, setSummaryDate]       = useState(new Date().toISOString().split("T")[0]);
+  const [summaryDate, setSummaryDate]       = useState(getTodayDate());
   const [summary, setSummary]               = useState(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
 
   // Tracking states
   const [trackerPlate, setTrackerPlate]     = useState("");
-  const [trackerDate, setTrackerDate]       = useState(new Date().toISOString().split("T")[0]);
+  const [trackerDate, setTrackerDate]       = useState(getTodayDate());
   const [trackerResult, setTrackerResult]   = useState(null);
   const [cumulativeSummary, setCumulativeSummary] = useState(null);
 
@@ -137,22 +145,20 @@ export default function StageOperator() {
     setShowMatatuDrop(false);
 
     let tripsToday = 0;
-
-    // Automated backend check for trips made today
     try {
       const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(cleanPlate)}&date=${form.date_issued}`, { headers });
       if (res.ok) {
         const data = await res.json();
-        tripsToday = data.trip_count || 0;
+        // ✅ Read main_stage_trips so sub-stage visits are completely ignored!
+        tripsToday = data.main_stage_trips !== undefined ? data.main_stage_trips : (data.trip_count || 0);
         setVehicleTripCount(tripsToday);
       }
     } catch (err) {
-      console.error("Failed to check vehicle trip status", err);
+      console.error("Trip check error", err);
     }
 
-    // Resolve route fee accurately
-    const targetRouteId = form.route_id || matatu.route_id;
-    const currentRoute = routes.find(r => r.id === parseInt(targetRouteId));
+    const targetRouteId = form.route_id || matatu.route_id || (routes[0]?.id || "");
+    const currentRoute = routes.find(r => r.id === parseInt(targetRouteId)) || routes[0];
     
     let calculatedFee = 100;
     if (currentRoute) {
@@ -168,7 +174,7 @@ export default function StageOperator() {
       matatu_id: matatu.id,
       plate: cleanPlate,
       owner_name: matatu.owner_member_no || "",
-      capacity: matatu.capacity || "",
+      capacity: matatu.capacity || f.capacity || "",
       route_id: currentRoute ? currentRoute.id : f.route_id,
       from_stage: currentRoute ? currentRoute.from_stage : f.from_stage,
       to_stage: currentRoute ? currentRoute.to_stage : f.to_stage,
@@ -176,45 +182,37 @@ export default function StageOperator() {
     }));
 
     if (tripsToday > 0) {
-      showToast(`ℹ️ ${cleanPlate} has already made ${tripsToday} trip(s) today. Fee automatically adjusted to subsequent rate: KES ${calculatedFee} (Trip #${tripsToday + 1}).`, "success");
+      showToast(`ℹ️ ${cleanPlate} Trip #${tripsToday + 1}: Suggested subsequent fee KES ${calculatedFee}. (Editable)`, "success");
     } else {
       showToast(`✅ ${cleanPlate} selected for 1st Trip (KES ${calculatedFee}).`, "success");
     }
   };
 
-  // ── STRICT VALIDATION GUARD FOR MULTI-TRIP RULE ──
-  const checkVehicleTripRule = async () => {
-    if (!form.plate || !form.date_issued) return true;
-    try {
-      const cleanPlate = form.plate.trim().toUpperCase();
-      const res = await fetch(`${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(cleanPlate)}&date=${form.date_issued}`, { headers });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.trip_count > 0) {
-          const currentRoute = routes.find(r => r.id === parseInt(form.route_id));
-          const maxAllowedSubsequentFee = currentRoute ? (parseFloat(currentRoute.subsequent_fee) || 100) : 100;
-          if (parseFloat(form.shimo_fee) > maxAllowedSubsequentFee) {
-            showToast(`⚠️ Vehicle ${cleanPlate} has already completed a trip today! Subsequent trip fee must be KES ${maxAllowedSubsequentFee}.`, "error");
-            return false;
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Trip verification check error", e);
-    }
-    return true;
-  };
-
+  // ── SAVE DRAFT (AUTO-MATCHES PLATE IF OPERATOR DIDN'T CLICK DROPDOWN) ──
   const saveDraft = async () => {
-    if (!form.matatu_id || !form.route_id || !form.mode_of_payment) {
-      return showToast("Fill in matatu, route, and payment mode", "error");
+    let activeMatatuId = form.matatu_id;
+    let activePlate = form.plate;
+    let activeOwner = form.owner_name;
+
+    // Fallback if operator typed plate without clicking dropdown
+    if (!activeMatatuId && matatuSearch.trim()) {
+      const match = matatus.find(m => m.plate.toUpperCase() === matatuSearch.trim().toUpperCase());
+      if (match) {
+        activeMatatuId = match.id;
+        activePlate = match.plate;
+        activeOwner = match.owner_member_no || "";
+      }
     }
-    
-    const isValidTripFee = await checkVehicleTripRule();
-    if (!isValidTripFee) return;
+
+    if (!activeMatatuId || !form.route_id || !form.mode_of_payment) {
+      return showToast("Select a valid matatu plate, route, and payment mode", "error");
+    }
 
     const payload = {
       ...form,
+      matatu_id: activeMatatuId,
+      plate: activePlate,
+      owner_name: activeOwner,
       sacco_name: saccoSettings.sacco_name,
       location: saccoSettings.location,
       po_box: saccoSettings.po_box,
@@ -222,6 +220,7 @@ export default function StageOperator() {
       issued_by: user?.id,
       operator_membership_no: user?.membership_no
     };
+
     const res = await fetch(`${API}/receipts`, {
       method: "POST", headers: { ...headers, "Content-Type": "application/json" },
       body: JSON.stringify(payload)
@@ -235,9 +234,6 @@ export default function StageOperator() {
 
   const updateDraft = async () => {
     if (!draft?.id) return;
-    const isValidTripFee = await checkVehicleTripRule();
-    if (!isValidTripFee) return;
-
     const payload = {
       ...form,
       sacco_name: saccoSettings.sacco_name,
@@ -254,53 +250,66 @@ export default function StageOperator() {
 
   const submitReceipt = async () => {
     if (!draft?.id) return showToast("Save a draft first", "error");
-    const isValidTripFee = await checkVehicleTripRule();
-    if (!isValidTripFee) {
-      showToast("Cannot submit: Adjust fee for subsequent trip rate!", "error");
-      return;
-    }
 
     if (!window.confirm("Submit this receipt? It cannot be edited after submission.")) return;
     const res = await fetch(`${API}/receipts/${draft.id}/submit`, { method: "PUT", headers });
     if (!res.ok) { const d = await res.json(); return showToast(d.error || "Submit failed", "error"); }
-    setSubmitted(true); showToast("Receipt submitted & locked ✓");
+    setSubmitted(true); 
+    showToast("Receipt submitted & locked ✓");
     fetchReceipts();
   };
 
+  // ── RESET FORM (CLEARS LOCKOUT SO VEHICLE 1, 2, 3, 4 FLOW SMOOTHLY) ──
   const resetForm = () => {
-    setDraft(null); setSubmitted(false); setMatatuSearch(""); setVehicleTripCount(0);
-    fetchMatatusList(); // Refresh matatus list in background
-    setForm({
-      sacco_name: saccoSettings.sacco_name || "2KM SACCO", matatu_id:"", plate:"", owner_name:"",
-      route_id:"", from_stage:"", to_stage:"", shimo_fee:"", capacity:"",
-      mode_of_payment:"Cash", date_issued: new Date().toISOString().split("T")[0],
-      operator_membership_no: user?.membership_no || ""
+    setDraft(null); 
+    setSubmitted(false); 
+    setMatatuSearch(""); 
+    setVehicleTripCount(0);
+    setShowMatatuDrop(false);
+    fetchMatatusList();
+
+    setForm(f => {
+      const activeRoute = routes.find(r => r.id === parseInt(f.route_id)) || routes[0];
+      return {
+        sacco_name: saccoSettings.sacco_name || "2KM SACCO", 
+        matatu_id: "", 
+        plate: "", 
+        owner_name: "",
+        route_id: activeRoute ? activeRoute.id : "", 
+        from_stage: activeRoute ? activeRoute.from_stage : "", 
+        to_stage: activeRoute ? activeRoute.to_stage : "", 
+        shimo_fee: activeRoute ? activeRoute.shimo_fee : "200", 
+        capacity: "",
+        mode_of_payment: "Cash", 
+        date_issued: getTodayDate(),
+        operator_membership_no: user?.membership_no || ""
+      };
     });
   };
 
   // ── SLIP PRINTING ──
- const printReceipt = async (r) => {
-  let tripNumber = 1;
-  let isFirstTrip = true;
-  const feePaid = parseFloat(r.shimo_fee || 0);
+  const printReceipt = async (r) => {
+    let tripNumber = 1;
+    let isFirstTrip = true;
+    const feePaid = parseFloat(r.shimo_fee || 0);
 
-  try {
-    const res = await fetch(
-      `${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(r.plate)}&date=${r.date_issued}`,
-      { headers }
-    );
-    if (res.ok) {
-      const data = await res.json();
-      const count = data.trip_count || 1;
-      isFirstTrip = count <= 1 && feePaid >= 150;
-      tripNumber = count;
+    try {
+      const res = await fetch(
+        `${API}/receipts/check-vehicle-trips?plate=${encodeURIComponent(r.plate)}&date=${r.date_issued}`,
+        { headers }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        const count = data.main_stage_trips || data.trip_count || 1;
+        isFirstTrip = count <= 1 && feePaid >= 150;
+        tripNumber = count;
+      }
+    } catch {
+      isFirstTrip = feePaid >= 150;
     }
-  } catch {
-    isFirstTrip = feePaid >= 150;
-  }
 
-  const win = window.open("", "_blank");
-  win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
+    const win = window.open("", "_blank");
+    win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
   <style>
     @page { size: 58mm auto; margin: 0; }
     html, body { margin: 0; padding: 0; }
@@ -324,13 +333,18 @@ export default function StageOperator() {
     <div class="line"><span>Owner No:</span><span>${r.owner_name || "N/A"}</span></div>
     <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
 
+    <div class="line box">
+      <span>Amount Paid:</span>
+      <span class="highlight">KES ${feePaid.toLocaleString()}</span>
+    </div>
+
     ${isFirstTrip ? `
-      <div class="line box">
+      <div class="line">
         <span>Savings Credited (${r.owner_name || "N/A"}):</span>
         <span class="highlight">KES 50.00</span>
       </div>
     ` : `
-      <div class="line box">
+      <div class="line">
         <span>Trip Cleared:</span>
         <span class="highlight">#${tripNumber}</span>
       </div>
@@ -345,9 +359,9 @@ export default function StageOperator() {
         : `*** Stage Clearance Slip (Trip #${tripNumber}) ***<br/>Stage Clearance Verified`}
     </div>
   </body></html>`);
-  win.document.close();
-  setTimeout(() => win.print(), 500);
-};
+    win.document.close();
+    setTimeout(() => win.print(), 500);
+  };
 
   const fetchSummary = async () => {
     setSummaryLoading(true);
@@ -428,8 +442,11 @@ export default function StageOperator() {
 
               <div className="relative">
                 <label className="text-sm font-medium text-gray-700">Matatu Plate</label>
-                <input type="text" placeholder="Search plate number..." value={matatuSearch}
-                  onChange={e => { setMatatuSearch(e.target.value); setShowMatatuDrop(true); }}
+                <input type="text" placeholder="Search or type plate number..." value={matatuSearch}
+                  onChange={e => { 
+                    setMatatuSearch(e.target.value); 
+                    setShowMatatuDrop(true); 
+                  }}
                   onFocus={() => { fetchMatatusList(); setShowMatatuDrop(true); }}
                   className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white uppercase font-bold"
                   disabled={submitted} />
@@ -440,7 +457,7 @@ export default function StageOperator() {
                         <p className="font-bold text-sm text-gray-800">{m.plate}</p>
                         <p className="text-xs text-gray-500">Owner: {m.owner_member_no}</p>
                       </div>
-                    )) : <p className="p-3 text-gray-500 text-sm">No matatu found</p>}
+                    )) : <p className="p-3 text-gray-500 text-sm">No registered matatu found (type exact plate)</p>}
                   </div>
                 )}
               </div>
@@ -473,12 +490,12 @@ export default function StageOperator() {
                   <input type="number" value={form.shimo_fee} onChange={e => setForm({...form,shimo_fee:e.target.value})}
                     className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 bg-white text-gray-800 font-bold text-blue-700" disabled={submitted} />
                   {vehicleTripCount > 0 ? (
-                    <p className="text-[10px] text-purple-700 font-bold mt-1">✓ Trip #{vehicleTripCount + 1}: Subsequent rate active.</p>
+                    <p className="text-[10px] text-purple-700 font-bold mt-1">✓ Main Stage Trip #{vehicleTripCount + 1}: Subsequent rate active.</p>
                   ) : (
-                    <p className="text-[10px] text-gray-500 mt-1">1st Trip standard route rate.</p>
+                    <p className="text-[10px] text-gray-500 mt-1">1st Main Stage Trip standard rate.</p>
                   )}
                 </div>
-                 <div>
+                <div>
                   <label className="text-sm font-medium text-gray-700">Capacity</label>
                   <input type="number" value={form.capacity} onChange={e => setForm({...form,capacity:e.target.value})}
                     placeholder="e.g. 14" className="border border-gray-300 p-2.5 w-full rounded-lg mt-1 outline-none focus:border-blue-500 text-gray-800 bg-white" disabled={submitted} />
@@ -511,15 +528,31 @@ export default function StageOperator() {
                 </div>
               )}
 
-              <div className="flex gap-3 pt-2">
-                {!draft && <button onClick={saveDraft} className="bg-yellow-500 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-yellow-600">💾 Save Draft</button>}
+              {/* ACTION BUTTONS WITH CLEAR/CANCEL BUTTON TO PREVENT LOCKOUT */}
+              <div className="flex flex-wrap gap-3 pt-2">
+                {!draft && (
+                  <button onClick={saveDraft} className="bg-yellow-500 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-yellow-600">
+                    💾 Save Draft
+                  </button>
+                )}
                 {draft && !submitted && (<>
-                  <button onClick={updateDraft} className="bg-yellow-500 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-yellow-600">✏️ Update Draft</button>
-                  <button onClick={submitReceipt} className="bg-green-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-green-700">✅ Submit</button>
+                  <button onClick={updateDraft} className="bg-yellow-500 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-yellow-600">
+                    ✏️ Update Draft
+                  </button>
+                  <button onClick={submitReceipt} className="bg-green-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-green-700">
+                    ✅ Submit Receipt
+                  </button>
+                  <button onClick={resetForm} className="bg-gray-400 text-white font-bold px-3 py-2.5 rounded-lg hover:bg-gray-500">
+                    ✕ Cancel Draft
+                  </button>
                 </>)}
                 {submitted && (<>
-                  <button onClick={() => printReceipt({...form,...draft})} className="bg-purple-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-purple-700">🖨️ Print Slip</button>
-                  <button onClick={resetForm} className="bg-blue-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-blue-700">+ New Receipt</button>
+                  <button onClick={() => printReceipt({...form,...draft})} className="bg-purple-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-purple-700">
+                    🖨️ Print Slip
+                  </button>
+                  <button onClick={resetForm} className="bg-blue-600 text-white font-bold px-4 py-2.5 rounded-lg hover:bg-blue-700">
+                    + Next Vehicle
+                  </button>
                 </>)}
               </div>
             </div>

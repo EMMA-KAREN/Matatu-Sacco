@@ -210,7 +210,7 @@ const resetForm = () => {
   }));
 };
 
-  // ── SLIP PRINTING: FULL SACCO DETAILS INCLUDED & SHIMO FEE REMOVED ──
+// ── SLIP PRINTING: FULL SACCO DETAILS INCLUDED & AMOUNT PAID INCLUDED ──
   const printReceipt = (r) => {
     const win = window.open("", "_blank");
     win.document.write(`<html><head><title>Receipt ${r.ticket_number}</title>
@@ -224,6 +224,7 @@ const resetForm = () => {
     .line { display: flex; justify-content: space-between; gap: 4px; margin: 1px 0; padding-bottom: 1px; border-bottom: 1px dashed #999; font-size: 9px; }
     .line span:last-child { text-align: right; }
     .highlight { font-weight: bold; }
+    .box { border-top: 1px solid #000; border-bottom: 1px solid #000; padding: 1px 0; font-weight: bold; }
     .footer { text-align: center; margin-top: 3px; font-size: 8px; line-height: 1.1; }
   </style></head>
   <body>
@@ -236,6 +237,7 @@ const resetForm = () => {
     <div class="line"><span>Plate:</span><span class="highlight">${r.plate}</span></div>
     <div class="line"><span>Owner:</span><span>${r.owner_name || "N/A"}</span></div>
     <div class="line"><span>Route:</span><span>${r.from_stage} → ${r.to_stage}</span></div>
+    <div class="line box"><span>Amount Paid:</span><span class="highlight">KES ${parseFloat(r.shimo_fee || 0).toLocaleString()}</span></div>
     <div class="line"><span>${r.date_issued}</span><span>${r.time_issued || ""}</span></div>
     <div class="line"><span>Operator:</span><span>${r.operator_membership_no || user?.membership_no || "Sub-Branch"}</span></div>
     <div class="footer">*** Sub-Branch Entry Slip ***<br/>Validated for Stage Dispatch</div>

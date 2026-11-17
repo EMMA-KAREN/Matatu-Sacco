@@ -1576,16 +1576,19 @@ def submit_receipt(id):
         return jsonify({"message": f"Receipt submitted; KES {receipt.shimo_fee:,.0f} credited to Sub-Branch Welfare ✓"})
 
     # ── MAIN STAGE ──
-    prior_trips = Receipt.query.filter(
+    # ✅ FIX: Only count prior trips that had a full Main Stage fee (>= 150)
+    prior_main_trips = Receipt.query.filter(
         db.func.upper(db.func.trim(Receipt.plate)) == clean_plate,
         Receipt.date_issued == receipt.date_issued,
         Receipt.is_submitted == True,
+        Receipt.shimo_fee >= 150,
         Receipt.id != receipt.id
     ).count()
 
     total_fee = float(receipt.shimo_fee)
 
-    if prior_trips == 0 and total_fee >= 150:
+    # If this is the vehicle's first time paying the main stage fee today:
+    if prior_main_trips == 0 and total_fee >= 150:
         # ── 1ST TRIP BREAKDOWN: KES 50 Savings, KES 100 Police, Remaining to Welfare ──
         savings_cut = 50.0
         police_cut = 100.0
@@ -1617,7 +1620,7 @@ def submit_receipt(id):
             )
             db.session.add(welfare_entry)
 
-        # Police expense
+        # Police expense pool
         police_expense = StageExpense(
             matatu_plate=clean_plate,
             type="Police Fee",
@@ -1636,7 +1639,7 @@ def submit_receipt(id):
         db.session.add(police_expense)
     else:
         # ── 2ND & SUBSEQUENT TRIPS (100% TO WELFARE) ──
-        trip_num = prior_trips + 1
+        trip_num = prior_main_trips + 1
         welfare_subsequent_entry = WelfareLedger(
             type="Inflow",
             recipient_or_source=f"Main Stage trip #{trip_num} — {clean_plate}",
@@ -5871,25 +5874,34 @@ def get_all_active_members():
 @jwt_required()
 def check_vehicle_trips():
     plate = request.args.get("plate", "").strip().upper()
-    date_filter = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    date_filter = request.args.get("date")
 
     if not plate:
         return jsonify({"error": "Plate number required"}), 400
 
-    # Case-insensitive and trimmed lookup for submitted receipts today
-    receipts = Receipt.query.filter(
+    query = Receipt.query.filter(
         db.func.upper(db.func.trim(Receipt.plate)) == plate,
-        Receipt.date_issued == date_filter,
         Receipt.is_submitted == True
-    ).all()
+    )
+
+    if date_filter:
+        query = query.filter(Receipt.date_issued == date_filter)
+
+    receipts = query.all()
+    # Exclude sub-stage collections (KES 50/100) so they NEVER count as trip #1 at main stage
+    main_stage_trips = [
+        r for r in receipts 
+        if float(r.shimo_fee or 0) >= 150 and (r.from_stage or "").lower() != "sub-branch stage"
+    ]
 
     return jsonify({
         "plate": plate,
         "date": date_filter,
-        "trip_count": len(receipts),
-        "is_first_trip": len(receipts) == 0
+        "trip_count": len(main_stage_trips),        # ✅ FIXED: Now only returns main stage trips
+        "main_stage_trips": len(main_stage_trips),
+        "total_all_stages": len(receipts),
+        "is_first_trip": len(main_stage_trips) == 0
     })
-
 
 @app.route("/stage/penalties-all", methods=["GET"])
 @jwt_required()

@@ -4,6 +4,7 @@ import { useAuth } from "../context/AuthContext";
 import OwnerDashboard from "../components/OwnerDashboard";
 import HRDashboard from "./HRDashboard";
 import StageOperator from "./StageOperator";
+import MemberDashboard from "./MemberDashboard"; // <--- 1. IMPORT MEMBER DASHBOARD
 import AdminDashboard from "../context/AdminDashboard";
 import SaccoHome from "../components/SaccoHome";
 import MainLayout from "../layout/MainLayout";
@@ -20,10 +21,12 @@ export default function DashboardRouter() {
       return <HRDashboard />;
     case "stage_operator":
       return <StageOperator />;
+    case "member": // <--- 2. ADD MEMBER CASE ROUTING
+      return <MemberDashboard />;
     case "director":
     case "admin":
       return <AdminDashboard />;
-  default:
+    default:
       return (
         <MainLayout>
           <SaccoHome user={user} />

@@ -14,6 +14,7 @@ import SubStageOperator from "./pages/SubStageOperator";
 import DriverDashboard from "./pages/DriverDashboard";
 import OwnerDashboard from "./components/OwnerDashboard";
 import AdminDashboard from "./context/AdminDashboard";
+import MemberDashboard from "./pages/MemberDashboard"; 
 
 function OwnerDashboardWrapper() {
   const { user } = useAuth();
@@ -49,7 +50,7 @@ function App() {
     <Route path="/sub-stage-operator" element={<SubStageOperator />} />
     <Route path="/driver" element={<DriverDashboard />} />
     <Route path="/conductor" element={<DriverDashboard />} />
-
+    <Route path="/member" element={<MemberDashboard />} /> 
     {/* Plain pages that rely on the shared sidebar */}
     <Route element={<MainLayout />}>
       <Route path="/matatus" element={<Matatus />} />
